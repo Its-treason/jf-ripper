@@ -1,50 +1,55 @@
-use std::path::PathBuf;
-
 use clap::{Parser, Subcommand};
 
-use crate::bluray::read_title;
+use crate::bluray::{disc_info, list_titles, read_title};
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 pub struct Cli {
-    #[arg(short, long, value_name = "FILE")]
-    config: Option<PathBuf>,
-
-    #[arg(short, long)]
-    debug: bool,
-
     #[command(subcommand)]
-    command: Option<Commands>,
+    command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Print information about a Blu-Ray disc
+    DiscInfo {
+        /// Path to a Blu-Ray drive or image
+        #[arg(long, default_value = "/dev/sr0")]
+        bd_path: String,
+    },
+    /// List titles available on a Blu-Ray disc
+    ListTitles {
+        /// Path to a Blu-Ray drive or image
+        #[arg(long, default_value = "/dev/sr0")]
+        bd_path: String,
+    },
+    /// Read a Blu-Ray title to a file
     ReadTitle {
         #[arg(long)]
         title: u32,
         #[arg(long)]
-        out_path: PathBuf,
+        out_path: String,
+        /// Path to a Blu-Ray drive or image
+        #[arg(long, default_value = "/dev/sr0")]
+        bd_path: String,
     },
 }
 
 pub fn execute_cli() {
     let cli = Cli::parse();
 
-    // You can see how many times a particular flag or argument occurred
-    // Note, only flags can have multiple occurrences
-    match cli.debug {
-        true => println!("Debug mode is on"),
-        false => println!("Debug mode is off"),
-    }
-
-    // You can check for the existence of subcommands, and if found use their
-    // matches just as you would the top level cmd
-    match &cli.command {
-        Some(Commands::ReadTitle { out_path, title }) => {
-            let device = "/dev/sr0";
-
-            read_title(*title, out_path.to_str().unwrap(), device);
+    let result = match &cli.command {
+        Commands::DiscInfo { bd_path } => disc_info(bd_path),
+        Commands::ListTitles { bd_path } => list_titles(bd_path),
+        Commands::ReadTitle { title, out_path, bd_path } => {
+            read_title(*title, out_path, bd_path).map(|bytes| {
+                println!("Read {} bytes", bytes);
+            })
         }
-        None => {}
+    };
+
+    if let Err(e) = result {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
     }
 }
