@@ -131,6 +131,16 @@ pub fn disc_info(bd_path: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn format_duration(ticks: u64) -> String {
+    let secs = ticks / 90_000;
+    format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+}
+
+fn lang_str(lang: &[u8; 4]) -> &str {
+    let end = lang.iter().position(|&b| b == 0).unwrap_or(lang.len());
+    std::str::from_utf8(&lang[..end]).unwrap_or("???")
+}
+
 pub fn list_titles(bd_path: &str) -> Result<(), Box<dyn Error>> {
     let bd_path_c = format!("{}\0", bd_path);
     let device = CStr::from_bytes_with_nul(bd_path_c.as_bytes())?;
@@ -145,19 +155,86 @@ pub fn list_titles(bd_path: &str) -> Result<(), Box<dyn Error>> {
         let main_title = bd_get_main_title(bd);
 
         println!("Main title: {}", main_title);
+        println!();
 
         for i in 0..total_titles {
             let info = bd_get_title_info(bd, i, 0);
             if info.is_null() {
                 continue;
             }
-            let info_ref = &*info;
-            // duration is in 90kHz ticks
-            let duration_secs = info_ref.duration / 90_000;
-            let hours = duration_secs / 3600;
-            let minutes = (duration_secs % 3600) / 60;
-            let secs = duration_secs % 60;
-            println!("Title: {}, Duration: {:02}:{:02}:{:02}", info_ref.idx, hours, minutes, secs);
+            let t = &*info;
+
+            println!(
+                "Title {:>3}  playlist={:05}  duration={}  angles={}  chapters={}  clips={}  marks={}",
+                t.idx, t.playlist,
+                format_duration(t.duration),
+                t.angle_count, t.chapter_count, t.clip_count, t.mark_count,
+            );
+
+            // Chapters
+            if t.chapter_count > 0 && !t.chapters.is_null() {
+                let chapters = std::slice::from_raw_parts(t.chapters, t.chapter_count as usize);
+                for ch in chapters {
+                    println!(
+                        "  Chapter {:>3}  start={}  duration={}  clip={}",
+                        ch.idx,
+                        format_duration(ch.start),
+                        format_duration(ch.duration),
+                        ch.clip_ref,
+                    );
+                }
+            }
+
+            // Clips with stream details
+            if t.clip_count > 0 && !t.clips.is_null() {
+                let clips = std::slice::from_raw_parts(t.clips, t.clip_count as usize);
+                for (ci, clip) in clips.iter().enumerate() {
+                    println!(
+                        "  Clip {:>3}  in={}  out={}  pkts={}",
+                        ci,
+                        format_duration(clip.in_time),
+                        format_duration(clip.out_time),
+                        clip.pkt_count,
+                    );
+
+                    if clip.video_stream_count > 0 && !clip.video_streams.is_null() {
+                        let streams = std::slice::from_raw_parts(clip.video_streams, clip.video_stream_count as usize);
+                        for s in streams {
+                            println!("    Video  codec=0x{:02x}  format={}  rate={}  pid=0x{:04x}", s.coding_type, s.format, s.rate, s.pid);
+                        }
+                    }
+
+                    if clip.audio_stream_count > 0 && !clip.audio_streams.is_null() {
+                        let streams = std::slice::from_raw_parts(clip.audio_streams, clip.audio_stream_count as usize);
+                        for s in streams {
+                            println!("    Audio  codec=0x{:02x}  lang={}  pid=0x{:04x}", s.coding_type, lang_str(&s.lang), s.pid);
+                        }
+                    }
+
+                    if clip.pg_stream_count > 0 && !clip.pg_streams.is_null() {
+                        let streams = std::slice::from_raw_parts(clip.pg_streams, clip.pg_stream_count as usize);
+                        for s in streams {
+                            println!("    Subtitle  lang={}  pid=0x{:04x}", lang_str(&s.lang), s.pid);
+                        }
+                    }
+
+                    if clip.sec_audio_stream_count > 0 && !clip.sec_audio_streams.is_null() {
+                        let streams = std::slice::from_raw_parts(clip.sec_audio_streams, clip.sec_audio_stream_count as usize);
+                        for s in streams {
+                            println!("    SecAudio  codec=0x{:02x}  lang={}  pid=0x{:04x}", s.coding_type, lang_str(&s.lang), s.pid);
+                        }
+                    }
+
+                    if clip.sec_video_stream_count > 0 && !clip.sec_video_streams.is_null() {
+                        let streams = std::slice::from_raw_parts(clip.sec_video_streams, clip.sec_video_stream_count as usize);
+                        for s in streams {
+                            println!("    SecVideo  codec=0x{:02x}  pid=0x{:04x}", s.coding_type, s.pid);
+                        }
+                    }
+                }
+            }
+
+            println!();
             bd_free_title_info(info);
         }
     }
