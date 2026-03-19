@@ -4,7 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ffmpeg-next = "8.0.0"
+ffmpeg-next = "8.1.0"
 libbluray-sys = "1.0.1"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2.183"
+dialoguer = { version = "0.11", features = ["fuzzy-select"] }
+indicatif = "0.17"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+dirs = "6"
