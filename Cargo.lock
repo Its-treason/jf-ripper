@@ -115,6 +115,7 @@ dependencies = [
  "clap",
  "ffmpeg-next",
  "libbluray-sys",
+ "libc",
 ]
 
 [[package]]

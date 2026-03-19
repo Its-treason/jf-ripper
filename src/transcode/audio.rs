@@ -1,18 +1,107 @@
+use std::ffi::c_void;
+
 use ffmpeg_next::{
     codec, format, frame, rescale::Rescale, software::resampling, ChannelLayout, Dictionary, Error,
     Packet, Rational,
 };
+use libc::c_int;
 
 use super::error::TranscodeError;
+
+// AVAudioFifo is not exposed by ffmpeg-sys-next, so we declare the opaque type
+// and the functions we need ourselves.
+#[repr(C)]
+struct AVAudioFifo {
+    _opaque: [u8; 0],
+}
+
+unsafe extern "C" {
+    fn av_audio_fifo_alloc(
+        sample_fmt: ffmpeg_next::ffi::AVSampleFormat,
+        channels: c_int,
+        nb_samples: c_int,
+    ) -> *mut AVAudioFifo;
+
+    fn av_audio_fifo_free(af: *mut AVAudioFifo);
+
+    fn av_audio_fifo_write(
+        af: *mut AVAudioFifo,
+        data: *const *mut c_void,
+        nb_samples: c_int,
+    ) -> c_int;
+
+    fn av_audio_fifo_read(
+        af: *mut AVAudioFifo,
+        data: *const *mut c_void,
+        nb_samples: c_int,
+    ) -> c_int;
+
+    fn av_audio_fifo_size(af: *const AVAudioFifo) -> c_int;
+}
+
+/// Safe wrapper around AVAudioFifo.
+struct AudioFifo {
+    ptr: *mut AVAudioFifo,
+}
+
+unsafe impl Send for AudioFifo {}
+
+impl AudioFifo {
+    fn new(
+        format: ffmpeg_next::ffi::AVSampleFormat,
+        channels: i32,
+        initial_size: i32,
+    ) -> Result<Self, TranscodeError> {
+        let ptr = unsafe { av_audio_fifo_alloc(format, channels, initial_size) };
+        if ptr.is_null() {
+            return Err(TranscodeError::Ffmpeg(ffmpeg_next::Error::Unknown));
+        }
+        Ok(Self { ptr })
+    }
+
+    fn write(&mut self, frame: &frame::Audio) -> Result<(), TranscodeError> {
+        let planes = frame.planes();
+        let ptrs: Vec<*mut c_void> = (0..planes)
+            .map(|i| unsafe { (*frame.as_ptr()).data[i] as *mut c_void })
+            .collect();
+
+        let result =
+            unsafe { av_audio_fifo_write(self.ptr, ptrs.as_ptr(), frame.samples() as c_int) };
+        if result < 0 {
+            return Err(TranscodeError::Ffmpeg(ffmpeg_next::Error::from(result)));
+        }
+        Ok(())
+    }
+
+    fn read(&mut self, frame: &mut frame::Audio, nb_samples: i32) -> Result<i32, TranscodeError> {
+        let planes = frame.planes();
+        let ptrs: Vec<*mut c_void> = (0..planes)
+            .map(|i| unsafe { (*frame.as_mut_ptr()).data[i] as *mut c_void })
+            .collect();
+
+        let result = unsafe { av_audio_fifo_read(self.ptr, ptrs.as_ptr(), nb_samples) };
+        if result < 0 {
+            return Err(TranscodeError::Ffmpeg(ffmpeg_next::Error::from(result)));
+        }
+        Ok(result)
+    }
+
+    fn size(&self) -> i32 {
+        unsafe { av_audio_fifo_size(self.ptr) }
+    }
+}
+
+impl Drop for AudioFifo {
+    fn drop(&mut self) {
+        unsafe { av_audio_fifo_free(self.ptr) };
+    }
+}
 
 pub struct AudioTranscoder {
     pub decoder: codec::decoder::Audio,
     pub encoder: codec::encoder::audio::Encoder,
     pub resampler: Option<resampling::Context>,
-    /// Sample buffer for encoders that require fixed frame sizes (e.g. AAC = 1024 samples)
-    sample_buf: Vec<f32>,
-    /// Samples per channel in the buffer
-    buffered_samples: usize,
+    fifo: AudioFifo,
     pub in_tb: Rational,
     /// Set after write_header() by reading back the muxer-chosen time base
     pub out_tb: Rational,
@@ -97,15 +186,18 @@ impl AudioTranscoder {
             None
         };
 
-        // Buffer capacity: 4 frames worth of samples per channel
-        let buf_cap = if frame_size > 0 { frame_size * 8 } else { 4096 };
+        let channels = enc_channel_layout.channels() as i32;
+        let fifo = AudioFifo::new(
+            enc_format.into(),
+            channels,
+            frame_size.max(1) as i32,
+        )?;
 
         Ok(Self {
             decoder,
             encoder,
             resampler,
-            sample_buf: vec![0.0f32; buf_cap],
-            buffered_samples: 0,
+            fifo,
             in_tb: in_stream.time_base(),
             out_tb: Rational(1, 1),
             out_stream_idx,
@@ -118,19 +210,23 @@ impl AudioTranscoder {
     }
 
     pub fn send_packet(&mut self, packet: &Packet) -> Result<(), TranscodeError> {
-        self.decoder.send_packet(packet)?;
-        Ok(())
+        match self.decoder.send_packet(packet) {
+            // TrueHD (and some other codecs) can return AVERROR_INVALIDDATA for
+            // initial sync / header-only packets; skip them rather than aborting.
+            Err(Error::InvalidData) => Ok(()),
+            result => Ok(result?),
+        }
     }
 
-    /// Drain decoded frames, resample if needed, encode in fixed-size chunks,
-    /// and return all encoded packets.
+    /// Drain decoded frames, resample if needed, buffer into the FIFO, and
+    /// encode whenever enough samples are available.
     pub fn receive_packets(&mut self) -> Result<Vec<Packet>, TranscodeError> {
         let mut output = Vec::new();
         let mut decoded = frame::Audio::empty();
 
         while self.decoder.receive_frame(&mut decoded).is_ok() {
-            let frame_to_encode = self.resample_frame(&decoded)?;
-            self.encode_frame(frame_to_encode, &mut output, false)?;
+            let frame = self.resample_frame(&decoded)?;
+            self.buffer_and_encode(Some(frame), &mut output, false)?;
         }
 
         Ok(output)
@@ -143,12 +239,12 @@ impl AudioTranscoder {
         let mut decoded = frame::Audio::empty();
 
         while self.decoder.receive_frame(&mut decoded).is_ok() {
-            let frame_to_encode = self.resample_frame(&decoded)?;
-            self.encode_frame(frame_to_encode, &mut output, false)?;
+            let frame = self.resample_frame(&decoded)?;
+            self.buffer_and_encode(Some(frame), &mut output, false)?;
         }
 
-        // Flush remaining buffered samples as a final partial frame
-        self.encode_frame(None, &mut output, true)?;
+        // Drain any remaining samples in the FIFO
+        self.buffer_and_encode(None, &mut output, true)?;
 
         self.encoder.send_eof()?;
         self.drain_encoder(&mut output)?;
@@ -156,33 +252,31 @@ impl AudioTranscoder {
         Ok(output)
     }
 
-    fn resample_frame(
-        &mut self,
-        decoded: &frame::Audio,
-    ) -> Result<Option<frame::Audio>, TranscodeError> {
+    fn resample_frame(&mut self, decoded: &frame::Audio) -> Result<frame::Audio, TranscodeError> {
         if let Some(resampler) = &mut self.resampler {
             let mut resampled = frame::Audio::empty();
             resampler
                 .run(decoded, &mut resampled)
                 .map_err(TranscodeError::Ffmpeg)?;
             resampled.set_pts(decoded.pts());
-            Ok(Some(resampled))
+            Ok(resampled)
         } else {
-            Ok(Some(decoded.clone()))
+            Ok(decoded.clone())
         }
     }
 
-    fn encode_frame(
+    fn buffer_and_encode(
         &mut self,
         frame: Option<frame::Audio>,
         output: &mut Vec<Packet>,
         flush: bool,
     ) -> Result<(), TranscodeError> {
-        // If encoder accepts variable frame sizes, send directly
+        // Variable frame size: bypass the FIFO and send directly
         if self.frame_size == 0 {
             if let Some(mut f) = frame {
                 if let Some(pts) = f.pts() {
-                    let rescaled = pts.rescale(self.in_tb, Rational(1, self.enc_sample_rate as i32));
+                    let rescaled =
+                        pts.rescale(self.in_tb, Rational(1, self.enc_sample_rate as i32));
                     f.set_pts(Some(rescaled));
                 }
                 self.encoder.send_frame(&f)?;
@@ -191,25 +285,32 @@ impl AudioTranscoder {
             return Ok(());
         }
 
-        // Fixed frame size: send to encoder only when we have enough samples
+        // Write the incoming frame into the FIFO
         if let Some(f) = frame {
-            let samples = f.samples();
-            // TODO: a proper AVAudioFifo would be more efficient;
-            // this simplified path just sends full frames directly if they
-            // already match the required size, otherwise drops partial frames.
-            if samples == self.frame_size {
-                let mut f = f;
-                f.set_pts(Some(self.next_pts));
-                self.next_pts += self.frame_size as i64;
-                self.encoder.send_frame(&f)?;
-                self.drain_encoder(output)?;
-            } else if flush {
-                // Send whatever we have with a flush
-                let mut f = f;
-                f.set_pts(Some(self.next_pts));
-                self.encoder.send_frame(&f)?;
-                self.drain_encoder(output)?;
+            self.fifo.write(&f)?;
+        }
+
+        // Drain the FIFO in frame_size chunks
+        loop {
+            let available = self.fifo.size();
+            let enough = if flush {
+                available > 0
+            } else {
+                available >= self.frame_size as i32
+            };
+            if !enough {
+                break;
             }
+
+            let samples = available.min(self.frame_size as i32);
+            let mut out_frame =
+                frame::Audio::new(self.enc_format, samples as usize, self.enc_channel_layout);
+            self.fifo.read(&mut out_frame, samples)?;
+            out_frame.set_pts(Some(self.next_pts));
+            self.next_pts += samples as i64;
+
+            self.encoder.send_frame(&out_frame)?;
+            self.drain_encoder(output)?;
         }
 
         Ok(())

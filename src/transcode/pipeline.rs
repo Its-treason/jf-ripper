@@ -75,6 +75,11 @@ pub fn run(
             VideoCodec::Copy => {
                 let mut out_stream = octx.add_stream(codec::encoder::find(codec::Id::None))?;
                 out_stream.set_parameters(in_stream.parameters());
+                // Clear container-specific codec tags (e.g. "HDMV" from m2ts) that
+                // are not valid in MKV/MP4; 0 tells the muxer to pick the right tag.
+                unsafe {
+                    (*(*out_stream.as_mut_ptr()).codecpar).codec_tag = 0;
+                }
                 let out_idx = out_stream.index();
                 actions[vsrc] = StreamAction::CopyVideo { out_idx };
             }
@@ -148,6 +153,9 @@ pub fn run(
 
         let mut out_stream = octx.add_stream(codec::encoder::find(codec::Id::None))?;
         out_stream.set_parameters(in_stream.parameters());
+        unsafe {
+            (*(*out_stream.as_mut_ptr()).codecpar).codec_tag = 0;
+        }
         out_stream.set_metadata(stream_metadata(&sub_cfg.language, &sub_cfg.name));
         let out_idx = out_stream.index();
         actions[src] = StreamAction::CopySubtitle { out_idx };
