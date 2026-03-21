@@ -12,6 +12,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libavfilter-dev \
     libswscale-dev \
     libbluray-dev \
+    libaacs-dev \
+    libbdplus-dev \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
@@ -22,17 +24,18 @@ COPY src/ src/
 RUN cargo build --release
 
 # --- Runtime stage ---
-FROM debian:bookworm-slim
+# Must match the builder's Debian version so shared library versions align.
+FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libavcodec59 \
-    libavformat59 \
-    libavutil57 \
-    libavdevice59 \
-    libavfilter8 \
-    libswscale6 \
+    libavcodec61 \
+    libavformat61 \
+    libavutil59 \
+    libavdevice61 \
+    libavfilter10 \
+    libswscale8 \
     libbluray2 \
-    libssl3 \
+    libssl3t64 \
     libaacs0 \
     libbdplus0 \
     eject \
