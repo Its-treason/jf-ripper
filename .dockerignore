@@ -1,0 +1,5 @@
+target/
+.git/
+*.md
+TODO.md
+HANDBRAKE_COMPARISON.md
