@@ -1,7 +1,9 @@
+use std::collections::HashSet;
 use std::ffi::CStr;
 
 use libbluray_sys::{
-    bd_free_title_info, bd_get_main_title, bd_get_title_info, bd_get_titles, bd_open,
+    bd_close, bd_free_title_info, bd_get_main_title, bd_get_title_info, bd_get_titles, bd_open,
+    bd_set_player_setting_str,
 };
 
 #[derive(Debug, Clone)]
@@ -34,6 +36,7 @@ pub struct AudioStreamInfo {
 pub struct SubtitleStreamInfo {
     pub index_in_clip: usize,
     pub language: String,
+    pub forced: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -56,7 +59,7 @@ fn lang_from_bytes(lang: &[u8; 4]) -> String {
         .to_string()
 }
 
-pub fn analyse_disc(bd_path: &str) -> Result<TitleAnalysis, Box<dyn std::error::Error>> {
+pub fn analyse_disc(bd_path: &str, player_language: &str) -> Result<TitleAnalysis, Box<dyn std::error::Error>> {
     let bd_path_c = format!("{}\0", bd_path);
     let device = CStr::from_bytes_with_nul(bd_path_c.as_bytes())?;
 
@@ -65,6 +68,13 @@ pub fn analyse_disc(bd_path: &str) -> Result<TitleAnalysis, Box<dyn std::error::
         if bd.is_null() {
             return Err(format!("Failed to open Blu-ray device at '{}' (no disc?)", bd_path).into());
         }
+
+        // Set player language for audio, subtitle, and menu selection
+        let lang_c = format!("{}\0", player_language);
+        let lang_cstr = CStr::from_bytes_with_nul(lang_c.as_bytes()).unwrap();
+        bd_set_player_setting_str(bd, 16, lang_cstr.as_ptr()); // BLURAY_PLAYER_SETTING_AUDIO_LANG
+        bd_set_player_setting_str(bd, 17, lang_cstr.as_ptr()); // BLURAY_PLAYER_SETTING_PG_LANG
+        bd_set_player_setting_str(bd, 18, lang_cstr.as_ptr()); // BLURAY_PLAYER_SETTING_MENU_LANG
 
         let total_titles = bd_get_titles(bd, 3, 10);
         let main_title = bd_get_main_title(bd) as u32;
@@ -79,17 +89,6 @@ pub fn analyse_disc(bd_path: &str) -> Result<TitleAnalysis, Box<dyn std::error::
             let t = &*info;
 
             let duration_secs = t.duration / 90_000;
-
-            // Score
-            let mut score: i32 = 0;
-            if t.idx == main_title {
-                score += 5;
-            }
-            if duration_secs < 300 {
-                score -= 1;
-            } else if duration_secs > 600 {
-                score += 1;
-            }
 
             // Chapters
             let chapters = if t.chapter_count > 0 && !t.chapters.is_null() {
@@ -136,6 +135,7 @@ pub fn analyse_disc(bd_path: &str) -> Result<TitleAnalysis, Box<dyn std::error::
                         subtitle_streams.push(SubtitleStreamInfo {
                             index_in_clip: idx,
                             language: lang_from_bytes(&s.lang),
+                            forced: false, // libbluray doesn't expose forced flag; detected during ffmpeg probe
                         });
                     }
                 }
@@ -149,16 +149,64 @@ pub fn analyse_disc(bd_path: &str) -> Result<TitleAnalysis, Box<dyn std::error::
                 chapters,
                 audio_streams,
                 subtitle_streams,
-                score,
+                score: 0,
             });
 
             bd_free_title_info(info);
+        }
+
+        // Two-pass scoring: compute relative scores now that we have all titles
+        let max_chapters = titles.iter().map(|t| t.chapter_count).max().unwrap_or(1).max(1) as f64;
+        let max_audio = titles.iter().map(|t| t.audio_streams.len()).max().unwrap_or(1).max(1) as f64;
+        let max_subs = titles.iter().map(|t| t.subtitle_streams.len()).max().unwrap_or(1).max(1) as f64;
+
+        for title in &mut titles {
+            let mut score: i32 = 0;
+
+            // Main title bonus
+            if title.index == main_title {
+                score += 10;
+            }
+
+            // Duration scoring
+            if title.duration_secs < 300 {
+                score -= 5;
+            } else if title.duration_secs > 3600 {
+                score += 5;
+            } else if title.duration_secs > 600 {
+                score += 2;
+            }
+
+            // Relative chapter count (up to +4)
+            score += ((title.chapter_count as f64 / max_chapters) * 4.0) as i32;
+
+            // Relative audio stream count (up to +3)
+            score += ((title.audio_streams.len() as f64 / max_audio) * 3.0) as i32;
+
+            // Relative subtitle stream count (up to +2)
+            score += ((title.subtitle_streams.len() as f64 / max_subs) * 2.0) as i32;
+
+            // Unique audio languages (up to +3)
+            let unique_langs: HashSet<&str> = title.audio_streams.iter()
+                .filter(|a| a.language != "und")
+                .map(|a| a.language.as_str())
+                .collect();
+            score += unique_langs.len().min(3) as i32;
+
+            // Bonus if audio matches player language
+            if title.audio_streams.iter().any(|a| a.language == player_language) {
+                score += 2;
+            }
+
+            title.score = score;
         }
 
         // Sort by score descending, then index ascending
         titles.sort_by(|a, b| b.score.cmp(&a.score).then(a.index.cmp(&b.index)));
 
         let detected_type = detect_disc_type(&titles, main_title);
+
+        bd_close(bd);
 
         Ok(TitleAnalysis {
             titles,

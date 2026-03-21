@@ -1,4 +1,4 @@
-use ffmpeg_next::{codec, format, media, Dictionary, Rational};
+use ffmpeg_next::{codec, format, media, rescale::Rescale, Dictionary, Rational};
 
 use super::{
     audio::AudioTranscoder,
@@ -6,6 +6,73 @@ use super::{
     error::TranscodeError,
     video::VideoTranscoder,
 };
+
+/// Tracks PTS for copy streams to detect and correct discontinuities.
+struct CopyPtsTracker {
+    first_pts: Option<i64>,
+    first_dts: Option<i64>,
+    expected_next_pts: i64,
+    pts_correction: i64,
+    last_pts: i64,
+    /// Approximate time base denominator / numerator for 1-second threshold
+    one_sec_threshold: i64,
+}
+
+impl CopyPtsTracker {
+    fn new(time_base: Rational) -> Self {
+        Self {
+            first_pts: None,
+            first_dts: None,
+            expected_next_pts: 0,
+            pts_correction: 0,
+            last_pts: 0,
+            one_sec_threshold: time_base.1 as i64 / time_base.0.max(1) as i64,
+        }
+    }
+
+    /// Adjust PTS/DTS for a copy-mode packet. Returns (adjusted_pts, adjusted_dts).
+    fn adjust(&mut self, pts: Option<i64>, dts: Option<i64>, is_audio: bool) -> (Option<i64>, Option<i64>) {
+        let raw_pts = match pts {
+            Some(p) => p,
+            None => return (pts, dts),
+        };
+
+        let first_pts = *self.first_pts.get_or_insert(raw_pts);
+        let first_dts = *self.first_dts.get_or_insert(dts.unwrap_or(raw_pts));
+
+        let normalized_pts = raw_pts - first_pts + self.pts_correction;
+
+        // Detect discontinuity
+        if self.expected_next_pts != 0 {
+            let diff = normalized_pts - self.expected_next_pts;
+            // For audio: only detect backward jumps (forward gaps may be intentional silence)
+            let is_discontinuity = if is_audio {
+                diff < -self.one_sec_threshold
+            } else {
+                diff.abs() > self.one_sec_threshold
+            };
+
+            if is_discontinuity {
+                eprintln!(
+                    "[copy] PTS discontinuity: expected {}, got {} (diff {}), correcting",
+                    self.expected_next_pts, normalized_pts, diff
+                );
+                self.pts_correction -= diff;
+                let normalized_pts = raw_pts - first_pts + self.pts_correction;
+                self.last_pts = normalized_pts;
+                self.expected_next_pts = 0; // reset; will be set from next packet
+                let adjusted_dts = dts.map(|d| d - first_dts + self.pts_correction);
+                return (Some(normalized_pts), adjusted_dts);
+            }
+        }
+
+        self.last_pts = normalized_pts;
+        self.expected_next_pts = normalized_pts; // next packet should be >= this
+
+        let adjusted_dts = dts.map(|d| d - first_dts + self.pts_correction);
+        (Some(normalized_pts), adjusted_dts)
+    }
+}
 
 /// Build a stream metadata Dictionary from optional language and name fields.
 fn stream_metadata<'a>(language: &'a Option<String>, name: &'a Option<String>) -> Dictionary<'a> {
@@ -155,10 +222,30 @@ pub fn run(
         out_stream.set_parameters(in_stream.parameters());
         unsafe {
             (*(*out_stream.as_mut_ptr()).codecpar).codec_tag = 0;
+            if sub_cfg.forced {
+                (*out_stream.as_mut_ptr()).disposition =
+                    ffmpeg_next::ffi::AV_DISPOSITION_FORCED as i32;
+            }
         }
         out_stream.set_metadata(stream_metadata(&sub_cfg.language, &sub_cfg.name));
         let out_idx = out_stream.index();
         actions[src] = StreamAction::CopySubtitle { out_idx };
+    }
+
+    // --- MP4 codec tags ---
+    // Set proper codec tags for MP4 containers (e.g. 'avc1' instead of generic H264).
+    // Without these, some players may not recognize the streams correctly.
+    if container_format == "mp4" {
+        for i in 0..octx.nb_streams() {
+            let stream = octx.stream(i as usize).unwrap();
+            unsafe {
+                let codecpar = (*stream.as_ptr()).codecpar;
+                let codec_id: codec::Id = (*codecpar).codec_id.into();
+                if let Some(tag) = mp4_codec_tag(codec_id) {
+                    (*(codecpar as *mut ffmpeg_next::ffi::AVCodecParameters)).codec_tag = tag;
+                }
+            }
+        }
     }
 
     // --- Chapters ---
@@ -196,13 +283,55 @@ pub fn run(
         at.out_tb = octx.stream(at.out_stream_idx).unwrap().time_base();
     }
 
+    // --- PTS trackers for copy streams ---
+    let mut copy_pts_trackers: Vec<Option<CopyPtsTracker>> = (0..nb_streams).map(|_| None).collect();
+    for (idx, action) in actions.iter().enumerate() {
+        match action {
+            StreamAction::CopyVideo { .. }
+            | StreamAction::CopyAudio { .. }
+            | StreamAction::CopySubtitle { .. } => {
+                let tb = ictx.stream(idx).unwrap().time_base();
+                copy_pts_trackers[idx] = Some(CopyPtsTracker::new(tb));
+            }
+            _ => {}
+        }
+    }
+
     // --- Main packet loop ---
     for (in_stream, mut packet) in ictx.packets() {
         let idx = in_stream.index();
         match &actions[idx] {
-            StreamAction::CopyVideo { out_idx }
-            | StreamAction::CopyAudio { out_idx }
-            | StreamAction::CopySubtitle { out_idx } => {
+            StreamAction::CopyVideo { out_idx } => {
+                if let Some(tracker) = &mut copy_pts_trackers[idx] {
+                    let (adj_pts, adj_dts) = tracker.adjust(packet.pts(), packet.dts(), false);
+                    let out_tb = octx.stream(*out_idx).unwrap().time_base();
+                    let in_tb = in_stream.time_base();
+                    if let Some(pts) = adj_pts {
+                        packet.set_pts(Some(pts.rescale(in_tb, out_tb)));
+                    }
+                    if let Some(dts) = adj_dts {
+                        packet.set_dts(Some(dts.rescale(in_tb, out_tb)));
+                    }
+                    packet.set_stream(*out_idx);
+                    packet.write_interleaved(&mut octx)?;
+                }
+            }
+            StreamAction::CopyAudio { out_idx } => {
+                if let Some(tracker) = &mut copy_pts_trackers[idx] {
+                    let (adj_pts, adj_dts) = tracker.adjust(packet.pts(), packet.dts(), true);
+                    let out_tb = octx.stream(*out_idx).unwrap().time_base();
+                    let in_tb = in_stream.time_base();
+                    if let Some(pts) = adj_pts {
+                        packet.set_pts(Some(pts.rescale(in_tb, out_tb)));
+                    }
+                    if let Some(dts) = adj_dts {
+                        packet.set_dts(Some(dts.rescale(in_tb, out_tb)));
+                    }
+                    packet.set_stream(*out_idx);
+                    packet.write_interleaved(&mut octx)?;
+                }
+            }
+            StreamAction::CopySubtitle { out_idx } => {
                 let out_tb = octx.stream(*out_idx).unwrap().time_base();
                 packet.rescale_ts(in_stream.time_base(), out_tb);
                 packet.set_stream(*out_idx);
@@ -250,4 +379,17 @@ pub fn run(
     octx.write_trailer()?;
 
     Ok(())
+}
+
+/// Return the MP4-specific codec tag for common codecs.
+/// These ensure proper identification in MP4/M4V containers.
+fn mp4_codec_tag(codec_id: codec::Id) -> Option<u32> {
+    match codec_id {
+        codec::Id::H264 => Some(0x31637661), // 'avc1'
+        codec::Id::HEVC => Some(0x31637668), // 'hvc1'
+        codec::Id::AC3 => Some(0x332D6361),  // 'ac-3'
+        codec::Id::EAC3 => Some(0x332D6365), // 'ec-3'
+        codec::Id::AAC => Some(0x6134706D),  // 'mp4a'
+        _ => None,
+    }
 }

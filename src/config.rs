@@ -78,12 +78,28 @@ fn default_video_codec() -> String {
     "copy".into()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LanguageConfig {
     #[serde(default)]
     pub audio: Vec<String>,
     #[serde(default)]
     pub subtitle: Vec<String>,
+    #[serde(default = "default_player_language")]
+    pub player_language: String,
+}
+
+fn default_player_language() -> String {
+    "eng".into()
+}
+
+impl Default for LanguageConfig {
+    fn default() -> Self {
+        Self {
+            audio: Vec::new(),
+            subtitle: Vec::new(),
+            player_language: default_player_language(),
+        }
+    }
 }
 
 impl Default for Config {

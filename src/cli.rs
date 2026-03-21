@@ -171,6 +171,7 @@ pub fn execute_cli() {
                     source_stream: src,
                     language: None,
                     name: None,
+                    forced: false,
                 });
             }
 
@@ -284,6 +285,11 @@ fn config_init(config_path: Option<&std::path::Path>) -> Result<(), Box<dyn std:
         .allow_empty(true)
         .interact_text()?;
 
+    let player_language: String = Input::new()
+        .with_prompt("Player language for disc menus/defaults (ISO 639-2, e.g. eng)")
+        .default("eng".into())
+        .interact_text()?;
+
     let config = Config {
         movie_dir: if movie_dir.is_empty() { None } else { Some(movie_dir) },
         show_dir: if show_dir.is_empty() { None } else { Some(show_dir) },
@@ -300,6 +306,7 @@ fn config_init(config_path: Option<&std::path::Path>) -> Result<(), Box<dyn std:
         languages: crate::config::LanguageConfig {
             audio: parse_comma_list(&audio_langs),
             subtitle: parse_comma_list(&subtitle_langs),
+            player_language,
         },
     };
 

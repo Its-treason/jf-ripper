@@ -2,7 +2,7 @@ use std::{error::Error, ffi::CStr};
 use std::fs::File;
 use std::io::Write;
 use libbluray_sys::{
-    bd_open, bd_get_titles, bd_select_title, bd_get_title_size, bd_tell, bd_read,
+    bd_close, bd_open, bd_get_titles, bd_select_title, bd_get_title_size, bd_tell, bd_read,
     bd_get_disc_info, bd_get_main_title, bd_get_title_info, bd_free_title_info,
 };
 
@@ -25,7 +25,13 @@ pub fn read_title(title: u32, out_path: &str, bd_path: &str) -> Result<u64, Box<
         let title_size = bd_get_title_size(bd);
         let mut current_pos = bd_tell(bd);
 
-        let mut file = File::create(out_path)?;
+        let mut file = match File::create(out_path) {
+            Ok(f) => f,
+            Err(e) => {
+                bd_close(bd);
+                return Err(e.into());
+            }
+        };
 
         loop {
             let chunk_size: u64 = 10_000_000;
@@ -43,6 +49,8 @@ pub fn read_title(title: u32, out_path: &str, bd_path: &str) -> Result<u64, Box<
                 break;
             }
         }
+
+        bd_close(bd);
     }
 
     Ok(total_read_bytes)
@@ -126,6 +134,8 @@ pub fn disc_info(bd_path: &str) -> Result<(), Box<dyn Error>> {
         println!("  Initial dynamic range: {}", info.initial_dynamic_range_type);
         let provider_data: String = info.provider_data.iter().map(|b| format!("{:02x}", b)).collect();
         println!("  Provider data: {}", provider_data);
+
+        bd_close(bd);
     }
 
     Ok(())
@@ -237,6 +247,8 @@ pub fn list_titles(bd_path: &str) -> Result<(), Box<dyn Error>> {
             println!();
             bd_free_title_info(info);
         }
+
+        bd_close(bd);
     }
 
     Ok(())

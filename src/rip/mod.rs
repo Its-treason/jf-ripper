@@ -13,6 +13,8 @@ use crate::transcode::{
     AudioAction, AudioConfig, ChapterInfo, SubtitleConfig, TranscodeJob, VideoCodec, VideoConfig,
 };
 
+use std::collections::HashMap;
+
 use self::analysis::{AnalysedTitle, TitleAnalysis};
 use self::tui::{AudioSelection, AudioSelectionAction, MediaChoice, MovieChoice, ShowChoice};
 
@@ -22,8 +24,14 @@ use self::tui::{AudioSelection, AudioSelectionAction, MediaChoice, MovieChoice, 
 struct ProbedStreams {
     /// (ffmpeg_stream_index, language) for each audio stream, in order
     audio: Vec<(usize, Option<String>)>,
-    /// (ffmpeg_stream_index, language) for each subtitle stream, in order
-    subtitle: Vec<(usize, Option<String>)>,
+    /// Probed subtitle streams with forced disposition detection
+    subtitle: Vec<ProbedSubtitleStream>,
+}
+
+struct ProbedSubtitleStream {
+    ffmpeg_index: usize,
+    language: Option<String>,
+    forced: bool,
 }
 
 fn probe_input_streams(input_path: &str) -> Result<ProbedStreams, Box<dyn std::error::Error>> {
@@ -40,7 +48,13 @@ fn probe_input_streams(input_path: &str) -> Result<ProbedStreams, Box<dyn std::e
                 audio.push((stream.index(), lang));
             }
             ffmpeg_next::media::Type::Subtitle => {
-                subtitle.push((stream.index(), lang));
+                let disposition = unsafe { (*stream.as_ptr()).disposition };
+                let forced = (disposition & ffmpeg_next::ffi::AV_DISPOSITION_FORCED as i32) != 0;
+                subtitle.push(ProbedSubtitleStream {
+                    ffmpeg_index: stream.index(),
+                    language: lang,
+                    forced,
+                });
             }
             _ => {}
         }
@@ -50,7 +64,7 @@ fn probe_input_streams(input_path: &str) -> Result<ProbedStreams, Box<dyn std::e
 }
 
 pub fn run_rip(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
-    let analysis = analysis::analyse_disc(&config.bd_path)?;
+    let analysis = analysis::analyse_disc(&config.bd_path, &config.languages.player_language)?;
     let choice = tui::run_tui(&analysis, config)?;
 
     match choice {
@@ -174,6 +188,56 @@ fn read_title_with_progress(
     Ok(bytes)
 }
 
+fn format_coding_type(ct: u8) -> &'static str {
+    match ct {
+        0x01 => "MPEG-1",
+        0x02 => "MPEG-2",
+        0x03 => "MPEG-2 Audio",
+        0x80 => "LPCM",
+        0x81 => "AC-3",
+        0x82 => "DTS",
+        0x83 => "TrueHD",
+        0x84 => "EAC-3",
+        0x85 => "DTS-HD",
+        0x86 => "DTS-HD MA",
+        0xA1 => "EAC-3 2nd",
+        0xA2 => "DTS-HD 2nd",
+        _ => "Unknown",
+    }
+}
+
+/// Generate track names with duplicate language numbering.
+/// E.g. ["English", "French", "English 2"] or ["English (TrueHD)", "English (AC-3)"]
+fn make_track_names(languages: &[String], codec_labels: &[String]) -> Vec<String> {
+    // Count occurrences of each language
+    let mut lang_counts: HashMap<&str, usize> = HashMap::new();
+    for lang in languages {
+        *lang_counts.entry(lang.as_str()).or_insert(0) += 1;
+    }
+
+    // For languages that appear more than once, append codec label or number
+    let mut lang_seen: HashMap<&str, usize> = HashMap::new();
+    let mut names = Vec::new();
+    for (i, lang) in languages.iter().enumerate() {
+        let count = lang_counts[lang.as_str()];
+        let seen = lang_seen.entry(lang.as_str()).or_insert(0);
+        *seen += 1;
+
+        let name = if count > 1 {
+            // Use codec label to disambiguate if available
+            if !codec_labels[i].is_empty() {
+                format!("{} ({})", lang, codec_labels[i])
+            } else {
+                format!("{} {}", lang, seen)
+            }
+        } else {
+            lang.clone()
+        };
+        names.push(name);
+    }
+    names
+}
+
 fn build_transcode_job(
     title: &AnalysedTitle,
     input_path: &str,
@@ -205,8 +269,41 @@ fn build_transcode_job(
             ..Default::default()
         });
 
+    // Build audio track names with duplicate language numbering
+    let audio_languages: Vec<String> = audio_selections
+        .iter()
+        .map(|sel| {
+            probed
+                .audio
+                .get(sel.stream_index_in_clip)
+                .and_then(|(_, lang)| lang.clone())
+                .unwrap_or_else(|| "und".into())
+        })
+        .collect();
+
+    let audio_codec_labels: Vec<String> = audio_selections
+        .iter()
+        .map(|sel| {
+            // Look up coding type from libbluray analysis
+            title
+                .audio_streams
+                .iter()
+                .find(|a| a.index_in_clip == sel.stream_index_in_clip)
+                .map(|a| match sel.action {
+                    AudioSelectionAction::Copy => format_coding_type(a.coding_type).to_string(),
+                    AudioSelectionAction::EncodeAac => format!(
+                        "{} → AAC",
+                        format_coding_type(a.coding_type)
+                    ),
+                })
+                .unwrap_or_default()
+        })
+        .collect();
+
+    let audio_names = make_track_names(&audio_languages, &audio_codec_labels);
+
     // Audio streams: use probed indices instead of assuming clip_index + 1
-    for sel in audio_selections {
+    for (i, sel) in audio_selections.iter().enumerate() {
         let (stream_idx, lang) = probed
             .audio
             .get(sel.stream_index_in_clip)
@@ -230,14 +327,29 @@ fn build_transcode_job(
         job = job.add_audio(AudioConfig {
             source_stream: *stream_idx,
             language: lang.clone(),
-            name: None,
+            name: Some(audio_names[i].clone()),
             action,
         });
     }
 
+    // Build subtitle track names with duplicate language numbering
+    let sub_languages: Vec<String> = subtitle_indices
+        .iter()
+        .map(|&idx| {
+            probed
+                .subtitle
+                .get(idx)
+                .and_then(|s| s.language.clone())
+                .unwrap_or_else(|| "und".into())
+        })
+        .collect();
+
+    let sub_codec_labels: Vec<String> = vec![String::new(); subtitle_indices.len()];
+    let sub_names = make_track_names(&sub_languages, &sub_codec_labels);
+
     // Subtitle streams: use probed indices
-    for &sub_clip_idx in subtitle_indices {
-        let (stream_idx, lang) = probed
+    for (i, &sub_clip_idx) in subtitle_indices.iter().enumerate() {
+        let probed_sub = probed
             .subtitle
             .get(sub_clip_idx)
             .ok_or_else(|| {
@@ -249,9 +361,10 @@ fn build_transcode_job(
             })?;
 
         job = job.add_subtitle(SubtitleConfig {
-            source_stream: *stream_idx,
-            language: lang.clone(),
-            name: None,
+            source_stream: probed_sub.ffmpeg_index,
+            language: probed_sub.language.clone(),
+            name: Some(sub_names[i].clone()),
+            forced: probed_sub.forced,
         });
     }
 

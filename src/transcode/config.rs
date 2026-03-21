@@ -76,6 +76,8 @@ pub struct SubtitleConfig {
     pub language: Option<String>,
     /// Human-readable track name (e.g. "Forced", "Full")
     pub name: Option<String>,
+    /// Whether this subtitle stream has the forced disposition
+    pub forced: bool,
 }
 
 /// A chapter mark to write into the output container
