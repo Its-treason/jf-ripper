@@ -12,6 +12,8 @@ pub struct VideoTranscoder {
     /// Set after write_header() by reading back the muxer-chosen time base
     pub out_tb: Rational,
     pub out_stream_idx: usize,
+    /// First PTS seen, used to normalize timestamps to start from 0
+    first_pts: Option<i64>,
 }
 
 impl VideoTranscoder {
@@ -88,6 +90,7 @@ impl VideoTranscoder {
             in_tb: in_stream.time_base(),
             out_tb: Rational(1, 1), // updated after write_header
             out_stream_idx,
+            first_pts: None,
         })
     }
 
@@ -103,13 +106,15 @@ impl VideoTranscoder {
         let mut decoded = frame::Video::empty();
 
         while self.decoder.receive_frame(&mut decoded).is_ok() {
-            // Rescale frame PTS to encoder time base
+            // Normalize PTS to start from 0, then rescale to encoder time base
             if let Some(pts) = decoded.pts() {
-                let rescaled = pts.rescale(self.in_tb, self.encoder.time_base());
+                let first = *self.first_pts.get_or_insert(pts);
+                let adjusted = pts - first;
+                let rescaled = adjusted.rescale(self.in_tb, self.encoder.time_base());
                 decoded.set_pts(Some(rescaled));
             }
 
-            let frame_to_encode = if let Some(scaler) = &mut self.scaler {
+            let mut frame_to_encode = if let Some(scaler) = &mut self.scaler {
                 let mut converted = frame::Video::empty();
                 scaler.run(&decoded, &mut converted).map_err(TranscodeError::Ffmpeg)?;
                 converted.set_pts(decoded.pts());
@@ -117,6 +122,13 @@ impl VideoTranscoder {
             } else {
                 decoded.clone()
             };
+
+            // Clear picture type so the encoder decides frame types on its own
+            // instead of inheriting forced IDR flags from the source stream.
+            unsafe {
+                (*frame_to_encode.as_mut_ptr()).pict_type =
+                    ffmpeg_next::ffi::AVPictureType::AV_PICTURE_TYPE_NONE;
+            }
 
             self.encoder.send_frame(&frame_to_encode)?;
             self.drain_encoder(&mut output)?;
@@ -133,11 +145,13 @@ impl VideoTranscoder {
         let mut decoded = frame::Video::empty();
         while self.decoder.receive_frame(&mut decoded).is_ok() {
             if let Some(pts) = decoded.pts() {
-                let rescaled = pts.rescale(self.in_tb, self.encoder.time_base());
+                let first = *self.first_pts.get_or_insert(pts);
+                let adjusted = pts - first;
+                let rescaled = adjusted.rescale(self.in_tb, self.encoder.time_base());
                 decoded.set_pts(Some(rescaled));
             }
 
-            let frame_to_encode = if let Some(scaler) = &mut self.scaler {
+            let mut frame_to_encode = if let Some(scaler) = &mut self.scaler {
                 let mut converted = frame::Video::empty();
                 scaler.run(&decoded, &mut converted).map_err(TranscodeError::Ffmpeg)?;
                 converted.set_pts(decoded.pts());
@@ -145,6 +159,13 @@ impl VideoTranscoder {
             } else {
                 decoded.clone()
             };
+
+            // Clear picture type so the encoder decides frame types on its own
+            // instead of inheriting forced IDR flags from the source stream.
+            unsafe {
+                (*frame_to_encode.as_mut_ptr()).pict_type =
+                    ffmpeg_next::ffi::AVPictureType::AV_PICTURE_TYPE_NONE;
+            }
 
             self.encoder.send_frame(&frame_to_encode)?;
             self.drain_encoder(&mut output)?;

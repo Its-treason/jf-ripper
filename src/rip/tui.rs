@@ -218,10 +218,12 @@ fn run_show_flow(
         return Err("No titles selected".into());
     }
 
-    let selected_indices: Vec<u32> = selected
+    let mut selected_indices: Vec<u32> = selected
         .iter()
         .map(|&i| analysis.titles[i].index)
         .collect();
+    // Sort by title index so episodes are ripped in disc order
+    selected_indices.sort();
 
     // TMDB lookup
     let show = tmdb_show_lookup(tmdb)?;

@@ -16,6 +16,39 @@ use crate::transcode::{
 use self::analysis::{AnalysedTitle, TitleAnalysis};
 use self::tui::{AudioSelection, AudioSelectionAction, MediaChoice, MovieChoice, ShowChoice};
 
+/// Probe an m2ts file to find the actual ffmpeg stream indices for each type,
+/// and read stream language metadata. This avoids hardcoding assumptions about
+/// stream ordering which can differ between libbluray clip info and ffmpeg.
+struct ProbedStreams {
+    /// (ffmpeg_stream_index, language) for each audio stream, in order
+    audio: Vec<(usize, Option<String>)>,
+    /// (ffmpeg_stream_index, language) for each subtitle stream, in order
+    subtitle: Vec<(usize, Option<String>)>,
+}
+
+fn probe_input_streams(input_path: &str) -> Result<ProbedStreams, Box<dyn std::error::Error>> {
+    ffmpeg_next::init()?;
+    let ictx = ffmpeg_next::format::input(&input_path)?;
+
+    let mut audio = Vec::new();
+    let mut subtitle = Vec::new();
+
+    for stream in ictx.streams() {
+        let lang = stream.metadata().get("language").map(|s| s.to_string());
+        match stream.parameters().medium() {
+            ffmpeg_next::media::Type::Audio => {
+                audio.push((stream.index(), lang));
+            }
+            ffmpeg_next::media::Type::Subtitle => {
+                subtitle.push((stream.index(), lang));
+            }
+            _ => {}
+        }
+    }
+
+    Ok(ProbedStreams { audio, subtitle })
+}
+
 pub fn run_rip(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let analysis = analysis::analyse_disc(&config.bd_path)?;
     let choice = tui::run_tui(&analysis, config)?;
@@ -154,6 +187,9 @@ fn build_transcode_job(
         fs::create_dir_all(parent)?;
     }
 
+    // Probe the actual m2ts file to get correct stream indices and languages
+    let probed = probe_input_streams(input_path)?;
+
     let video_codec = match config.transcode.video_codec.as_str() {
         "h264" => VideoCodec::H264,
         "h265" => VideoCodec::H265,
@@ -169,14 +205,18 @@ fn build_transcode_job(
             ..Default::default()
         });
 
-    // Audio streams: in the m2ts, stream 0 is video, audio starts at 1
+    // Audio streams: use probed indices instead of assuming clip_index + 1
     for sel in audio_selections {
-        let stream_idx = sel.stream_index_in_clip + 1; // +1 for video stream
-        let lang = title
-            .audio_streams
-            .iter()
-            .find(|a| a.index_in_clip == sel.stream_index_in_clip)
-            .map(|a| a.language.clone());
+        let (stream_idx, lang) = probed
+            .audio
+            .get(sel.stream_index_in_clip)
+            .ok_or_else(|| {
+                format!(
+                    "Audio stream {} not found in file (file has {} audio streams)",
+                    sel.stream_index_in_clip,
+                    probed.audio.len()
+                )
+            })?;
 
         let action = match sel.action {
             AudioSelectionAction::Copy => AudioAction::Copy,
@@ -188,26 +228,29 @@ fn build_transcode_job(
         };
 
         job = job.add_audio(AudioConfig {
-            source_stream: stream_idx,
-            language: lang,
+            source_stream: *stream_idx,
+            language: lang.clone(),
             name: None,
             action,
         });
     }
 
-    // Subtitle streams: after video + audio
-    let audio_count = title.audio_streams.len();
+    // Subtitle streams: use probed indices
     for &sub_clip_idx in subtitle_indices {
-        let stream_idx = 1 + audio_count + sub_clip_idx;
-        let lang = title
-            .subtitle_streams
-            .iter()
-            .find(|s| s.index_in_clip == sub_clip_idx)
-            .map(|s| s.language.clone());
+        let (stream_idx, lang) = probed
+            .subtitle
+            .get(sub_clip_idx)
+            .ok_or_else(|| {
+                format!(
+                    "Subtitle stream {} not found in file (file has {} subtitle streams)",
+                    sub_clip_idx,
+                    probed.subtitle.len()
+                )
+            })?;
 
         job = job.add_subtitle(SubtitleConfig {
-            source_stream: stream_idx,
-            language: lang,
+            source_stream: *stream_idx,
+            language: lang.clone(),
             name: None,
         });
     }
