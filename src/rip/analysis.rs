@@ -28,6 +28,7 @@ pub struct ChapterMark {
 #[derive(Debug, Clone)]
 pub struct AudioStreamInfo {
     pub index_in_clip: usize,
+    pub pid: u16,
     pub language: String,
     pub coding_type: u8,
 }
@@ -35,6 +36,7 @@ pub struct AudioStreamInfo {
 #[derive(Debug, Clone)]
 pub struct SubtitleStreamInfo {
     pub index_in_clip: usize,
+    pub pid: u16,
     pub language: String,
     pub forced: bool,
 }
@@ -120,6 +122,7 @@ pub fn analyse_disc(bd_path: &str, player_language: &str) -> Result<TitleAnalysi
                     for (idx, s) in streams.iter().enumerate() {
                         audio_streams.push(AudioStreamInfo {
                             index_in_clip: idx,
+                            pid: s.pid,
                             language: lang_from_bytes(&s.lang),
                             coding_type: s.coding_type,
                         });
@@ -134,6 +137,7 @@ pub fn analyse_disc(bd_path: &str, player_language: &str) -> Result<TitleAnalysi
                     for (idx, s) in streams.iter().enumerate() {
                         subtitle_streams.push(SubtitleStreamInfo {
                             index_in_clip: idx,
+                            pid: s.pid,
                             language: lang_from_bytes(&s.lang),
                             forced: false, // libbluray doesn't expose forced flag; detected during ffmpeg probe
                         });

@@ -13,24 +13,27 @@ use crate::transcode::{
     AudioAction, AudioConfig, ChapterInfo, SubtitleConfig, TranscodeJob, VideoCodec, VideoConfig,
 };
 
-use std::collections::HashMap;
-
 use self::analysis::{AnalysedTitle, TitleAnalysis};
 use self::tui::{AudioSelection, AudioSelectionAction, MediaChoice, MovieChoice, ShowChoice};
 
-/// Probe an m2ts file to find the actual ffmpeg stream indices for each type,
-/// and read stream language metadata. This avoids hardcoding assumptions about
-/// stream ordering which can differ between libbluray clip info and ffmpeg.
+/// Probe an m2ts file to find the actual ffmpeg stream indices for each type.
+/// Stores the MPEG-TS PID (stream id) so we can reliably match ffmpeg streams
+/// to libbluray streams — sequential ordering breaks when ffmpeg splits
+/// TrueHD+AC3-core into two separate streams.
 struct ProbedStreams {
-    /// (ffmpeg_stream_index, language) for each audio stream, in order
-    audio: Vec<(usize, Option<String>)>,
-    /// Probed subtitle streams with forced disposition detection
+    audio: Vec<ProbedAudioStream>,
     subtitle: Vec<ProbedSubtitleStream>,
+}
+
+struct ProbedAudioStream {
+    ffmpeg_index: usize,
+    /// MPEG-TS PID (from ffmpeg stream id)
+    pid: u16,
 }
 
 struct ProbedSubtitleStream {
     ffmpeg_index: usize,
-    language: Option<String>,
+    pid: u16,
     forced: bool,
 }
 
@@ -42,17 +45,20 @@ fn probe_input_streams(input_path: &str) -> Result<ProbedStreams, Box<dyn std::e
     let mut subtitle = Vec::new();
 
     for stream in ictx.streams() {
-        let lang = stream.metadata().get("language").map(|s| s.to_string());
+        let pid = unsafe { (*stream.as_ptr()).id as u16 };
         match stream.parameters().medium() {
             ffmpeg_next::media::Type::Audio => {
-                audio.push((stream.index(), lang));
+                audio.push(ProbedAudioStream {
+                    ffmpeg_index: stream.index(),
+                    pid,
+                });
             }
             ffmpeg_next::media::Type::Subtitle => {
                 let disposition = unsafe { (*stream.as_ptr()).disposition };
                 let forced = (disposition & ffmpeg_next::ffi::AV_DISPOSITION_FORCED as i32) != 0;
                 subtitle.push(ProbedSubtitleStream {
                     ffmpeg_index: stream.index(),
-                    language: lang,
+                    pid,
                     forced,
                 });
             }
@@ -206,36 +212,47 @@ fn format_coding_type(ct: u8) -> &'static str {
     }
 }
 
-/// Generate track names with duplicate language numbering.
-/// E.g. ["English", "French", "English 2"] or ["English (TrueHD)", "English (AC-3)"]
-fn make_track_names(languages: &[String], codec_labels: &[String]) -> Vec<String> {
-    // Count occurrences of each language
-    let mut lang_counts: HashMap<&str, usize> = HashMap::new();
-    for lang in languages {
-        *lang_counts.entry(lang.as_str()).or_insert(0) += 1;
+/// Convert ISO 639-2/B language code to its English name.
+fn iso639_to_name(code: &str) -> &str {
+    match code {
+        "eng" => "English",
+        "deu" | "ger" => "German",
+        "fra" | "fre" => "French",
+        "spa" => "Spanish",
+        "ita" => "Italian",
+        "por" => "Portuguese",
+        "rus" => "Russian",
+        "jpn" => "Japanese",
+        "kor" => "Korean",
+        "zho" | "chi" => "Chinese",
+        "ara" => "Arabic",
+        "hin" => "Hindi",
+        "nld" | "dut" => "Dutch",
+        "pol" => "Polish",
+        "swe" => "Swedish",
+        "nor" => "Norwegian",
+        "dan" => "Danish",
+        "fin" => "Finnish",
+        "ces" | "cze" => "Czech",
+        "hun" => "Hungarian",
+        "tur" => "Turkish",
+        "tha" => "Thai",
+        "vie" => "Vietnamese",
+        "ron" | "rum" => "Romanian",
+        "ell" | "gre" => "Greek",
+        "heb" => "Hebrew",
+        "cat" => "Catalan",
+        "bul" => "Bulgarian",
+        "hrv" => "Croatian",
+        "slk" | "slo" => "Slovak",
+        "slv" => "Slovenian",
+        "srp" => "Serbian",
+        "ukr" => "Ukrainian",
+        "ind" => "Indonesian",
+        "msa" | "may" => "Malay",
+        "und" => "Unknown",
+        other => other,
     }
-
-    // For languages that appear more than once, append codec label or number
-    let mut lang_seen: HashMap<&str, usize> = HashMap::new();
-    let mut names = Vec::new();
-    for (i, lang) in languages.iter().enumerate() {
-        let count = lang_counts[lang.as_str()];
-        let seen = lang_seen.entry(lang.as_str()).or_insert(0);
-        *seen += 1;
-
-        let name = if count > 1 {
-            // Use codec label to disambiguate if available
-            if !codec_labels[i].is_empty() {
-                format!("{} ({})", lang, codec_labels[i])
-            } else {
-                format!("{} {}", lang, seen)
-            }
-        } else {
-            lang.clone()
-        };
-        names.push(name);
-    }
-    names
 }
 
 fn build_transcode_job(
@@ -269,51 +286,36 @@ fn build_transcode_job(
             ..Default::default()
         });
 
-    // Build audio track names with duplicate language numbering
-    let audio_languages: Vec<String> = audio_selections
-        .iter()
-        .map(|sel| {
-            probed
-                .audio
-                .get(sel.stream_index_in_clip)
-                .and_then(|(_, lang)| lang.clone())
-                .unwrap_or_else(|| "und".into())
-        })
-        .collect();
+    // Match libbluray streams to ffmpeg streams by PID.
+    // Sequential index matching breaks when ffmpeg splits TrueHD+AC3-core
+    // into two streams while libbluray counts them as one.
+    for sel in audio_selections {
+        let bd_stream = title
+            .audio_streams
+            .iter()
+            .find(|a| a.index_in_clip == sel.stream_index_in_clip)
+            .ok_or_else(|| {
+                format!("Audio stream {} not in libbluray analysis", sel.stream_index_in_clip)
+            })?;
 
-    let audio_codec_labels: Vec<String> = audio_selections
-        .iter()
-        .map(|sel| {
-            // Look up coding type from libbluray analysis
-            title
-                .audio_streams
-                .iter()
-                .find(|a| a.index_in_clip == sel.stream_index_in_clip)
-                .map(|a| match sel.action {
-                    AudioSelectionAction::Copy => format_coding_type(a.coding_type).to_string(),
-                    AudioSelectionAction::EncodeAac => format!(
-                        "{} → AAC",
-                        format_coding_type(a.coding_type)
-                    ),
-                })
-                .unwrap_or_default()
-        })
-        .collect();
-
-    let audio_names = make_track_names(&audio_languages, &audio_codec_labels);
-
-    // Audio streams: use probed indices instead of assuming clip_index + 1
-    for (i, sel) in audio_selections.iter().enumerate() {
-        let (stream_idx, lang) = probed
+        // Find ffmpeg stream by PID; take the first match (primary codec, not AC3 core)
+        let probed_stream = probed
             .audio
-            .get(sel.stream_index_in_clip)
+            .iter()
+            .find(|p| p.pid == bd_stream.pid)
             .ok_or_else(|| {
                 format!(
-                    "Audio stream {} not found in file (file has {} audio streams)",
-                    sel.stream_index_in_clip,
-                    probed.audio.len()
+                    "Audio PID 0x{:04x} (libbluray stream {}) not found in ffmpeg probe",
+                    bd_stream.pid, sel.stream_index_in_clip
                 )
             })?;
+
+        let lang = &bd_stream.language;
+        let codec_label = match sel.action {
+            AudioSelectionAction::Copy => format_coding_type(bd_stream.coding_type).to_string(),
+            AudioSelectionAction::EncodeAac => "AAC".to_string(),
+        };
+        let display_name = format!("{} ({})", iso639_to_name(lang), codec_label);
 
         let action = match sel.action {
             AudioSelectionAction::Copy => AudioAction::Copy,
@@ -325,45 +327,38 @@ fn build_transcode_job(
         };
 
         job = job.add_audio(AudioConfig {
-            source_stream: *stream_idx,
-            language: lang.clone(),
-            name: Some(audio_names[i].clone()),
+            source_stream: probed_stream.ffmpeg_index,
+            language: Some(lang.clone()),
+            name: Some(display_name),
             action,
         });
     }
 
-    // Build subtitle track names with duplicate language numbering
-    let sub_languages: Vec<String> = subtitle_indices
-        .iter()
-        .map(|&idx| {
-            probed
-                .subtitle
-                .get(idx)
-                .and_then(|s| s.language.clone())
-                .unwrap_or_else(|| "und".into())
-        })
-        .collect();
+    // Subtitle streams: match by PID, use libbluray language
+    for &sub_clip_idx in subtitle_indices {
+        let bd_stream = title
+            .subtitle_streams
+            .iter()
+            .find(|s| s.index_in_clip == sub_clip_idx)
+            .ok_or_else(|| {
+                format!("Subtitle stream {} not in libbluray analysis", sub_clip_idx)
+            })?;
 
-    let sub_codec_labels: Vec<String> = vec![String::new(); subtitle_indices.len()];
-    let sub_names = make_track_names(&sub_languages, &sub_codec_labels);
-
-    // Subtitle streams: use probed indices
-    for (i, &sub_clip_idx) in subtitle_indices.iter().enumerate() {
         let probed_sub = probed
             .subtitle
-            .get(sub_clip_idx)
+            .iter()
+            .find(|p| p.pid == bd_stream.pid)
             .ok_or_else(|| {
                 format!(
-                    "Subtitle stream {} not found in file (file has {} subtitle streams)",
-                    sub_clip_idx,
-                    probed.subtitle.len()
+                    "Subtitle PID 0x{:04x} (libbluray stream {}) not found in ffmpeg probe",
+                    bd_stream.pid, sub_clip_idx
                 )
             })?;
 
         job = job.add_subtitle(SubtitleConfig {
             source_stream: probed_sub.ffmpeg_index,
-            language: probed_sub.language.clone(),
-            name: Some(sub_names[i].clone()),
+            language: Some(bd_stream.language.clone()),
+            name: Some(iso639_to_name(&bd_stream.language).to_string()),
             forced: probed_sub.forced,
         });
     }
