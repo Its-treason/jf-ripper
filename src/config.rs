@@ -42,6 +42,8 @@ pub struct Config {
     pub transcode: TranscodeConfig,
     #[serde(default)]
     pub languages: LanguageConfig,
+    #[serde(default)]
+    pub distributed: DistributedConfig,
 }
 
 fn default_bd_path() -> String {
@@ -102,6 +104,64 @@ impl Default for LanguageConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DistributedConfig {
+    pub shared_dir: Option<String>,
+    #[serde(default = "default_worker_name")]
+    pub worker_name: String,
+    #[serde(default = "default_poll_interval")]
+    pub poll_interval_secs: u64,
+    #[serde(default = "default_max_concurrent")]
+    pub max_concurrent_jobs: u32,
+    #[serde(default = "default_stale_timeout")]
+    pub stale_lock_timeout_secs: u64,
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+    #[serde(default = "default_cleanup_raw")]
+    pub cleanup_raw_media: bool,
+}
+
+fn default_worker_name() -> String {
+    let mut buf = [0u8; 256];
+    let ret = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if ret == 0 {
+        let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..len]).into_owned()
+    } else {
+        "unknown".into()
+    }
+}
+
+fn default_poll_interval() -> u64 {
+    30
+}
+fn default_max_concurrent() -> u32 {
+    1
+}
+fn default_stale_timeout() -> u64 {
+    3600
+}
+fn default_max_retries() -> u32 {
+    3
+}
+fn default_cleanup_raw() -> bool {
+    true
+}
+
+impl Default for DistributedConfig {
+    fn default() -> Self {
+        Self {
+            shared_dir: None,
+            worker_name: default_worker_name(),
+            poll_interval_secs: default_poll_interval(),
+            max_concurrent_jobs: default_max_concurrent(),
+            stale_lock_timeout_secs: default_stale_timeout(),
+            max_retries: default_max_retries(),
+            cleanup_raw_media: default_cleanup_raw(),
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -113,6 +173,7 @@ impl Default for Config {
             eject_on_complete: false,
             transcode: TranscodeConfig::default(),
             languages: LanguageConfig::default(),
+            distributed: DistributedConfig::default(),
         }
     }
 }

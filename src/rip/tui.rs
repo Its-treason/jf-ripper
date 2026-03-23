@@ -42,24 +42,6 @@ fn format_duration(secs: u64) -> String {
     format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
 }
 
-fn format_coding_type(ct: u8) -> &'static str {
-    match ct {
-        0x01 => "MPEG-1",
-        0x02 => "MPEG-2",
-        0x03 => "MPEG-2 Audio",
-        0x80 => "LPCM",
-        0x81 => "AC-3",
-        0x82 => "DTS",
-        0x83 => "TrueHD",
-        0x84 => "EAC-3",
-        0x85 => "DTS-HD",
-        0x86 => "DTS-HD MA",
-        0xA1 => "EAC-3 2nd",
-        0xA2 => "DTS-HD 2nd",
-        _ => "Unknown",
-    }
-}
-
 pub fn run_tui(
     analysis: &TitleAnalysis,
     config: &Config,
@@ -345,7 +327,7 @@ fn select_audio_streams(
                 "Audio {}  {}  {}",
                 i,
                 s.language,
-                format_coding_type(s.coding_type),
+                super::format_coding_type(s.coding_type),
             )
         })
         .collect();

@@ -1,5 +1,7 @@
+use serde::{Deserialize, Serialize};
+
 /// Video codec to use when re-encoding
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum VideoCodec {
     H264,   // libx264
     H265,   // libx265
@@ -18,7 +20,7 @@ impl VideoCodec {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VideoConfig {
     pub codec: VideoCodec,
     /// Constant Rate Factor (lower = better quality, larger file)
@@ -43,8 +45,26 @@ impl Default for VideoConfig {
     }
 }
 
+impl VideoConfig {
+    pub fn from_transcode_config(tc: &crate::config::TranscodeConfig) -> Self {
+        let codec = match tc.video_codec.as_str() {
+            "h264" => VideoCodec::H264,
+            "h265" => VideoCodec::H265,
+            "av1" => VideoCodec::Av1,
+            _ => VideoCodec::Copy,
+        };
+        Self {
+            codec,
+            crf: tc.crf,
+            preset: tc.preset.clone(),
+            extra_options: Vec::new(),
+            source_stream: None,
+        }
+    }
+}
+
 /// What to do with an audio track
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum AudioAction {
     Copy,
     Encode {
@@ -57,7 +77,7 @@ pub enum AudioAction {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AudioConfig {
     /// Input stream index
     pub source_stream: usize,
@@ -68,7 +88,7 @@ pub struct AudioConfig {
     pub action: AudioAction,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SubtitleConfig {
     /// Input stream index
     pub source_stream: usize,
@@ -81,7 +101,7 @@ pub struct SubtitleConfig {
 }
 
 /// A chapter mark to write into the output container
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChapterInfo {
     /// Unique numeric ID (1-based)
     pub id: i64,
@@ -93,7 +113,7 @@ pub struct ChapterInfo {
     pub end_ms: i64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ContainerFormat {
     Mkv,
     Mp4,

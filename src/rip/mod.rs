@@ -10,34 +10,34 @@ use indicatif::{ProgressBar, ProgressStyle};
 use crate::bluray::read_title;
 use crate::config::Config;
 use crate::transcode::{
-    AudioAction, AudioConfig, ChapterInfo, SubtitleConfig, TranscodeJob, VideoCodec, VideoConfig,
+    AudioAction, AudioConfig, ChapterInfo, SubtitleConfig, TranscodeJob, VideoConfig,
 };
 
-use self::analysis::{AnalysedTitle, TitleAnalysis};
+use self::analysis::AnalysedTitle;
 use self::tui::{AudioSelection, AudioSelectionAction, MediaChoice, MovieChoice, ShowChoice};
 
 /// Probe an m2ts file to find the actual ffmpeg stream indices for each type.
 /// Stores the MPEG-TS PID (stream id) so we can reliably match ffmpeg streams
 /// to libbluray streams — sequential ordering breaks when ffmpeg splits
 /// TrueHD+AC3-core into two separate streams.
-struct ProbedStreams {
-    audio: Vec<ProbedAudioStream>,
-    subtitle: Vec<ProbedSubtitleStream>,
+pub(crate) struct ProbedStreams {
+    pub audio: Vec<ProbedAudioStream>,
+    pub subtitle: Vec<ProbedSubtitleStream>,
 }
 
-struct ProbedAudioStream {
-    ffmpeg_index: usize,
+pub(crate) struct ProbedAudioStream {
+    pub ffmpeg_index: usize,
     /// MPEG-TS PID (from ffmpeg stream id)
-    pid: u16,
+    pub pid: u16,
 }
 
-struct ProbedSubtitleStream {
-    ffmpeg_index: usize,
-    pid: u16,
-    forced: bool,
+pub(crate) struct ProbedSubtitleStream {
+    pub ffmpeg_index: usize,
+    pub pid: u16,
+    pub forced: bool,
 }
 
-fn probe_input_streams(input_path: &str) -> Result<ProbedStreams, Box<dyn std::error::Error>> {
+pub(crate) fn probe_input_streams(input_path: &str) -> Result<ProbedStreams, Box<dyn std::error::Error>> {
     ffmpeg_next::init()?;
     let ictx = ffmpeg_next::format::input(&input_path)?;
 
@@ -80,7 +80,7 @@ pub fn run_rip(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn rip_movie(
-    analysis: &TitleAnalysis,
+    analysis: &analysis::TitleAnalysis,
     choice: &MovieChoice,
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -120,7 +120,7 @@ fn rip_movie(
 }
 
 fn rip_show(
-    analysis: &TitleAnalysis,
+    analysis: &analysis::TitleAnalysis,
     choice: &ShowChoice,
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -172,7 +172,7 @@ fn rip_show(
     Ok(())
 }
 
-fn read_title_with_progress(
+pub(crate) fn read_title_with_progress(
     title_idx: u32,
     out_path: &str,
     bd_path: &str,
@@ -194,7 +194,7 @@ fn read_title_with_progress(
     Ok(bytes)
 }
 
-fn format_coding_type(ct: u8) -> &'static str {
+pub(crate) fn format_coding_type(ct: u8) -> &'static str {
     match ct {
         0x01 => "MPEG-1",
         0x02 => "MPEG-2",
@@ -213,7 +213,7 @@ fn format_coding_type(ct: u8) -> &'static str {
 }
 
 /// Convert ISO 639-2/B language code to its English name.
-fn iso639_to_name(code: &str) -> &str {
+pub(crate) fn iso639_to_name(code: &str) -> &str {
     match code {
         "eng" => "English",
         "deu" | "ger" => "German",
@@ -255,40 +255,19 @@ fn iso639_to_name(code: &str) -> &str {
     }
 }
 
-fn build_transcode_job(
+pub(crate) fn resolve_stream_configs(
     title: &AnalysedTitle,
     input_path: &str,
-    output_path: &Path,
     audio_selections: &[AudioSelection],
     subtitle_indices: &[usize],
     config: &Config,
-) -> Result<TranscodeJob, Box<dyn std::error::Error>> {
-    // Ensure output directory exists
-    if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    // Probe the actual m2ts file to get correct stream indices and languages
+) -> Result<(Vec<AudioConfig>, Vec<SubtitleConfig>, Vec<ChapterInfo>), Box<dyn std::error::Error>> {
     let probed = probe_input_streams(input_path)?;
-
-    let video_codec = match config.transcode.video_codec.as_str() {
-        "h264" => VideoCodec::H264,
-        "h265" => VideoCodec::H265,
-        "av1" => VideoCodec::Av1,
-        _ => VideoCodec::Copy,
-    };
-
-    let mut job = TranscodeJob::new(input_path, output_path.to_string_lossy())
-        .video(VideoConfig {
-            codec: video_codec,
-            crf: config.transcode.crf,
-            preset: config.transcode.preset.clone(),
-            ..Default::default()
-        });
 
     // Match libbluray streams to ffmpeg streams by PID.
     // Sequential index matching breaks when ffmpeg splits TrueHD+AC3-core
     // into two streams while libbluray counts them as one.
+    let mut audio_configs = Vec::new();
     for sel in audio_selections {
         let bd_stream = title
             .audio_streams
@@ -326,7 +305,7 @@ fn build_transcode_job(
             },
         };
 
-        job = job.add_audio(AudioConfig {
+        audio_configs.push(AudioConfig {
             source_stream: probed_stream.ffmpeg_index,
             language: Some(lang.clone()),
             name: Some(display_name),
@@ -335,6 +314,7 @@ fn build_transcode_job(
     }
 
     // Subtitle streams: match by PID, use libbluray language
+    let mut subtitle_configs = Vec::new();
     for &sub_clip_idx in subtitle_indices {
         let bd_stream = title
             .subtitle_streams
@@ -355,7 +335,7 @@ fn build_transcode_job(
                 )
             })?;
 
-        job = job.add_subtitle(SubtitleConfig {
+        subtitle_configs.push(SubtitleConfig {
             source_stream: probed_sub.ffmpeg_index,
             language: Some(bd_stream.language.clone()),
             name: Some(iso639_to_name(&bd_stream.language).to_string()),
@@ -379,6 +359,35 @@ fn build_transcode_job(
         })
         .collect();
 
+    Ok((audio_configs, subtitle_configs, chapters))
+}
+
+fn build_transcode_job(
+    title: &AnalysedTitle,
+    input_path: &str,
+    output_path: &Path,
+    audio_selections: &[AudioSelection],
+    subtitle_indices: &[usize],
+    config: &Config,
+) -> Result<TranscodeJob, Box<dyn std::error::Error>> {
+    // Ensure output directory exists
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let (audio_tracks, subtitle_tracks, chapters) = resolve_stream_configs(
+        title, input_path, audio_selections, subtitle_indices, config,
+    )?;
+
+    let mut job = TranscodeJob::new(input_path, output_path.to_string_lossy())
+        .video(VideoConfig::from_transcode_config(&config.transcode));
+
+    for audio in audio_tracks {
+        job = job.add_audio(audio);
+    }
+    for sub in subtitle_tracks {
+        job = job.add_subtitle(sub);
+    }
     if !chapters.is_empty() {
         job = job.chapters(chapters);
     }

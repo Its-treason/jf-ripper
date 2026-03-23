@@ -89,6 +89,26 @@ enum Commands {
         #[arg(long)]
         no_eject: bool,
     },
+    /// Create distributed transcoding jobs from a Blu-ray disc
+    CreateJobs {
+        /// Config file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Override Blu-ray device path
+        #[arg(long)]
+        bd_path: Option<String>,
+    },
+    /// Run as a distributed transcoding worker
+    Worker {
+        /// Config file path
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Manage distributed transcoding jobs
+    Jobs {
+        #[command(subcommand)]
+        action: JobsAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -100,6 +120,30 @@ enum ConfigAction {
     },
     /// Show the current configuration
     Show {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum JobsAction {
+    /// List all jobs and their status
+    List {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Retry all failed jobs
+    Retry {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Clean up completed jobs
+    Clean {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Recover jobs with stale heartbeats
+    RecoverStale {
         #[arg(long)]
         config: Option<PathBuf>,
     },
@@ -203,6 +247,38 @@ pub fn execute_cli() {
             }
             crate::rip::run_rip(&cfg).map_err(Into::into)
         }
+        Commands::CreateJobs {
+            config: config_path,
+            bd_path,
+        } => {
+            let mut cfg = Config::load_or_default(config_path.as_deref());
+            if let Some(p) = bd_path {
+                cfg.bd_path = p.clone();
+            }
+            crate::distributed::reader::run_create_jobs(&cfg).map_err(Into::into)
+        }
+        Commands::Worker { config: config_path } => {
+            let cfg = Config::load_or_default(config_path.as_deref());
+            crate::distributed::worker::run_worker(&cfg).map_err(Into::into)
+        }
+        Commands::Jobs { action } => match action {
+            JobsAction::List { config: config_path } => {
+                let cfg = Config::load_or_default(config_path.as_deref());
+                crate::distributed::manager::list_jobs(&cfg)
+            }
+            JobsAction::Retry { config: config_path } => {
+                let cfg = Config::load_or_default(config_path.as_deref());
+                crate::distributed::manager::retry_jobs(&cfg)
+            }
+            JobsAction::Clean { config: config_path } => {
+                let cfg = Config::load_or_default(config_path.as_deref());
+                crate::distributed::manager::clean_jobs(&cfg)
+            }
+            JobsAction::RecoverStale { config: config_path } => {
+                let cfg = Config::load_or_default(config_path.as_deref());
+                crate::distributed::manager::recover_stale(&cfg)
+            }
+        },
         Commands::Config { action } => match action {
             ConfigAction::Init { config: config_path } => {
                 config_init(config_path.as_deref()).map_err(Into::into)
@@ -308,6 +384,7 @@ fn config_init(config_path: Option<&std::path::Path>) -> Result<(), Box<dyn std:
             subtitle: parse_comma_list(&subtitle_langs),
             player_language,
         },
+        distributed: crate::config::DistributedConfig::default(),
     };
 
     config.save(&path)?;
