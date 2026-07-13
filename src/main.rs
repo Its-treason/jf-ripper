@@ -1,6 +1,8 @@
 use crate::cli::execute_cli;
 mod bluray;
 mod cli;
+mod disc;
+mod dvd;
 pub mod config;
 pub mod rip;
 pub mod tmdb;

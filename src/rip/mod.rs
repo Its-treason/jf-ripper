@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod dvd_analysis;
 pub mod jellyfin;
 pub mod tui;
 
@@ -7,8 +8,8 @@ use std::path::Path;
 
 use indicatif::{ProgressBar, ProgressStyle};
 
-use crate::bluray::read_title;
 use crate::config::Config;
+use crate::disc::{detect_disc_format, DiscFormat};
 use crate::transcode::{
     AudioAction, AudioConfig, ChapterInfo, SubtitleConfig, TranscodeJob, VideoConfig,
 };
@@ -39,7 +40,12 @@ pub(crate) struct ProbedSubtitleStream {
 
 pub(crate) fn probe_input_streams(input_path: &str) -> Result<ProbedStreams, Box<dyn std::error::Error>> {
     ffmpeg_next::init()?;
-    let ictx = ffmpeg_next::format::input(&input_path)?;
+    // DVD subpicture streams can start minutes into the program stream, so
+    // probe far deeper than the defaults. Harmless for m2ts input.
+    let mut opts = ffmpeg_next::Dictionary::new();
+    opts.set("probesize", "200000000");
+    opts.set("analyzeduration", "120000000");
+    let ictx = ffmpeg_next::format::input_with_dictionary(&input_path, opts)?;
 
     let mut audio = Vec::new();
     let mut subtitle = Vec::new();
@@ -70,7 +76,17 @@ pub(crate) fn probe_input_streams(input_path: &str) -> Result<ProbedStreams, Box
 }
 
 pub fn run_rip(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
-    let analysis = analysis::analyse_disc(&config.bd_path, &config.languages.player_language)?;
+    let format = detect_disc_format(&config.bd_path)?;
+    println!("Detected: {}", format);
+
+    let analysis = match format {
+        DiscFormat::BluRay => {
+            analysis::analyse_disc(&config.bd_path, &config.languages.player_language)?
+        }
+        DiscFormat::Dvd => {
+            dvd_analysis::analyse_dvd(&config.bd_path, &config.languages.player_language)?
+        }
+    };
     let choice = tui::run_tui(&analysis, config)?;
 
     match choice {
@@ -100,13 +116,18 @@ fn rip_movie(
 
     println!("\nRipping: {} -> {}", choice.tmdb, output_path.display());
 
-    let temp_m2ts = format!("{}/rip_{}.m2ts", config.temp_dir, choice.title_idx);
-    read_title_with_progress(choice.title_idx, &temp_m2ts, &config.bd_path)?;
+    let temp_raw = format!(
+        "{}/rip_{}.{}",
+        config.temp_dir,
+        choice.title_idx,
+        raw_extension(analysis.format)
+    );
+    read_title_with_progress(analysis.format, choice.title_idx, &temp_raw, &config.bd_path)?;
 
-    transcode_title(title, &temp_m2ts, &output_path, choice, config)?;
+    transcode_title(title, &temp_raw, &output_path, choice, config)?;
 
     // Cleanup temp file
-    let _ = fs::remove_file(&temp_m2ts);
+    let _ = fs::remove_file(&temp_raw);
 
     println!("Done: {}", output_path.display());
 
@@ -153,12 +174,17 @@ fn rip_show(
             output_path.display()
         );
 
-        let temp_m2ts = format!("{}/rip_{}.m2ts", config.temp_dir, title_idx);
-        read_title_with_progress(title_idx, &temp_m2ts, &config.bd_path)?;
+        let temp_raw = format!(
+            "{}/rip_{}.{}",
+            config.temp_dir,
+            title_idx,
+            raw_extension(analysis.format)
+        );
+        read_title_with_progress(analysis.format, title_idx, &temp_raw, &config.bd_path)?;
 
-        transcode_title_show(title, &temp_m2ts, &output_path, choice, config)?;
+        transcode_title_show(title, &temp_raw, &output_path, choice, config)?;
 
-        let _ = fs::remove_file(&temp_m2ts);
+        let _ = fs::remove_file(&temp_raw);
 
         println!("Done: {}", output_path.display());
     }
@@ -172,7 +198,16 @@ fn rip_show(
     Ok(())
 }
 
+/// Raw container extension for the temp rip file.
+pub(crate) fn raw_extension(format: DiscFormat) -> &'static str {
+    match format {
+        DiscFormat::BluRay => "m2ts",
+        DiscFormat::Dvd => "vob",
+    }
+}
+
 pub(crate) fn read_title_with_progress(
+    format: DiscFormat,
     title_idx: u32,
     out_path: &str,
     bd_path: &str,
@@ -184,7 +219,10 @@ pub(crate) fn read_title_with_progress(
     );
     pb.set_message("starting");
 
-    let bytes = read_title(title_idx, out_path, bd_path)?;
+    let bytes = match format {
+        DiscFormat::BluRay => crate::bluray::read_title(title_idx, out_path, bd_path)?,
+        DiscFormat::Dvd => crate::dvd::read_title(title_idx, out_path, bd_path)?,
+    };
 
     pb.finish_with_message(format!(
         "read {} MB",
@@ -324,16 +362,16 @@ pub(crate) fn resolve_stream_configs(
                 format!("Subtitle stream {} not in libbluray analysis", sub_clip_idx)
             })?;
 
-        let probed_sub = probed
-            .subtitle
-            .iter()
-            .find(|p| p.pid == bd_stream.pid)
-            .ok_or_else(|| {
-                format!(
-                    "Subtitle PID 0x{:04x} (libbluray stream {}) not found in ffmpeg probe",
-                    bd_stream.pid, sub_clip_idx
-                )
-            })?;
+        // Subtitle streams flagged in the disc metadata sometimes never
+        // occur in the actual stream (esp. DVD subpictures) — skip instead
+        // of failing the whole rip.
+        let Some(probed_sub) = probed.subtitle.iter().find(|p| p.pid == bd_stream.pid) else {
+            eprintln!(
+                "Warning: subtitle stream 0x{:04x} ({}) not found in ffmpeg probe, skipping",
+                bd_stream.pid, bd_stream.language
+            );
+            continue;
+        };
 
         subtitle_configs.push(SubtitleConfig {
             source_stream: probed_sub.ffmpeg_index,

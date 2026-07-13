@@ -9,8 +9,10 @@ use super::{
 
 /// Tracks PTS for copy streams to detect and correct discontinuities.
 struct CopyPtsTracker {
-    first_pts: Option<i64>,
-    first_dts: Option<i64>,
+    /// Single normalization offset applied to both PTS and DTS, anchored on
+    /// the first timestamp seen. Using one offset preserves pts >= dts for
+    /// B-frame streams, which separate per-field offsets would break.
+    offset: Option<i64>,
     expected_next_pts: i64,
     pts_correction: i64,
     last_pts: i64,
@@ -21,8 +23,7 @@ struct CopyPtsTracker {
 impl CopyPtsTracker {
     fn new(time_base: Rational) -> Self {
         Self {
-            first_pts: None,
-            first_dts: None,
+            offset: None,
             expected_next_pts: 0,
             pts_correction: 0,
             last_pts: 0,
@@ -32,15 +33,22 @@ impl CopyPtsTracker {
 
     /// Adjust PTS/DTS for a copy-mode packet. Returns (adjusted_pts, adjusted_dts).
     fn adjust(&mut self, pts: Option<i64>, dts: Option<i64>, is_audio: bool) -> (Option<i64>, Option<i64>) {
-        let raw_pts = match pts {
-            Some(p) => p,
-            None => return (pts, dts),
+        let offset = match self.offset {
+            Some(o) => o,
+            None => match dts.or(pts) {
+                Some(anchor) => *self.offset.insert(anchor),
+                None => return (pts, dts),
+            },
         };
 
-        let first_pts = *self.first_pts.get_or_insert(raw_pts);
-        let first_dts = *self.first_dts.get_or_insert(dts.unwrap_or(raw_pts));
+        let raw_pts = match pts {
+            Some(p) => p,
+            // No PTS on this packet (common in DVD MPEG-PS): still normalize
+            // the DTS so it stays consistent with neighboring packets.
+            None => return (None, dts.map(|d| d - offset + self.pts_correction)),
+        };
 
-        let normalized_pts = raw_pts - first_pts + self.pts_correction;
+        let normalized_pts = raw_pts - offset + self.pts_correction;
 
         // Detect discontinuity
         if self.expected_next_pts != 0 {
@@ -58,10 +66,10 @@ impl CopyPtsTracker {
                     self.expected_next_pts, normalized_pts, diff
                 );
                 self.pts_correction -= diff;
-                let normalized_pts = raw_pts - first_pts + self.pts_correction;
+                let normalized_pts = raw_pts - offset + self.pts_correction;
                 self.last_pts = normalized_pts;
                 self.expected_next_pts = 0; // reset; will be set from next packet
-                let adjusted_dts = dts.map(|d| d - first_dts + self.pts_correction);
+                let adjusted_dts = dts.map(|d| d - offset + self.pts_correction);
                 return (Some(normalized_pts), adjusted_dts);
             }
         }
@@ -69,7 +77,7 @@ impl CopyPtsTracker {
         self.last_pts = normalized_pts;
         self.expected_next_pts = normalized_pts; // next packet should be >= this
 
-        let adjusted_dts = dts.map(|d| d - first_dts + self.pts_correction);
+        let adjusted_dts = dts.map(|d| d - offset + self.pts_correction);
         (Some(normalized_pts), adjusted_dts)
     }
 }
@@ -108,7 +116,11 @@ pub fn run(
 ) -> Result<(), TranscodeError> {
     ffmpeg_next::init()?;
 
-    let mut ictx = format::input(&input_path)?;
+    // DVD MPEG-PS leaves PTS unset on many packets; have the demuxer generate
+    // them from DTS (same as ffmpeg's -fflags +genpts). No effect on m2ts.
+    let mut in_opts = Dictionary::new();
+    in_opts.set("fflags", "+genpts");
+    let mut ictx = format::input_with_dictionary(&input_path, in_opts)?;
     let mut octx = format::output_as(&output_path, container_format)?;
 
     let needs_global_header = octx
@@ -184,6 +196,11 @@ pub fn run(
             AudioAction::Copy => {
                 let mut out_stream = octx.add_stream(codec::encoder::find(codec::Id::None))?;
                 out_stream.set_parameters(in_stream.parameters());
+                // Clear container-specific codec tags (e.g. DTS-HD's from m2ts)
+                // that are not valid in MKV/MP4, same as the video copy path.
+                unsafe {
+                    (*(*out_stream.as_mut_ptr()).codecpar).codec_tag = 0;
+                }
                 out_stream.set_metadata(stream_metadata(&audio_cfg.language, &audio_cfg.name));
                 let out_idx = out_stream.index();
                 actions[src] = StreamAction::CopyAudio { out_idx };

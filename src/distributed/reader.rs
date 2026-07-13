@@ -2,10 +2,12 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use crate::config::Config;
+use crate::disc::{detect_disc_format, DiscFormat};
 use crate::rip::analysis::analyse_disc;
+use crate::rip::dvd_analysis::analyse_dvd;
 use crate::rip::jellyfin;
 use crate::rip::tui::{self, MediaChoice, MovieChoice, ShowChoice};
-use crate::rip::{read_title_with_progress, resolve_stream_configs};
+use crate::rip::{raw_extension, read_title_with_progress, resolve_stream_configs};
 use crate::transcode::{ContainerFormat, VideoConfig};
 
 use super::fs_ops::{self, SharedDirs};
@@ -20,7 +22,13 @@ pub fn run_create_jobs(config: &Config) -> Result<(), Box<dyn std::error::Error>
     let dirs = SharedDirs::new(shared_dir);
     dirs.ensure_dirs()?;
 
-    let analysis = analyse_disc(&config.bd_path, &config.languages.player_language)?;
+    let format = detect_disc_format(&config.bd_path)?;
+    println!("Detected: {}", format);
+
+    let analysis = match format {
+        DiscFormat::BluRay => analyse_disc(&config.bd_path, &config.languages.player_language)?,
+        DiscFormat::Dvd => analyse_dvd(&config.bd_path, &config.languages.player_language)?,
+    };
     let choice = tui::run_tui(&analysis, config)?;
 
     match choice {
@@ -42,11 +50,12 @@ fn create_movie_job(
         .ok_or("Selected title not found")?;
 
     let id = Uuid::new_v4();
-    let media_file = format!("{}.m2ts", id);
+    let media_file = format!("{}.{}", id, raw_extension(analysis.format));
     let media_path = dirs.media.join(&media_file);
 
     println!("Reading title {} to shared media...", choice.title_idx);
     read_title_with_progress(
+        analysis.format,
         choice.title_idx,
         &media_path.to_string_lossy(),
         &config.bd_path,
@@ -121,11 +130,16 @@ fn create_show_jobs(
 
     for &title_idx in &choice.title_indices {
         let id = Uuid::new_v4();
-        let media_file = format!("{}.m2ts", id);
+        let media_file = format!("{}.{}", id, raw_extension(analysis.format));
         let media_path = dirs.media.join(&media_file);
 
         println!("Reading title {}...", title_idx);
-        read_title_with_progress(title_idx, &media_path.to_string_lossy(), &config.bd_path)?;
+        read_title_with_progress(
+            analysis.format,
+            title_idx,
+            &media_path.to_string_lossy(),
+            &config.bd_path,
+        )?;
         title_media.push((title_idx, id, media_file));
     }
 

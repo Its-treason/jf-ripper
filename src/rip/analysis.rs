@@ -52,6 +52,7 @@ pub struct TitleAnalysis {
     pub titles: Vec<AnalysedTitle>,
     pub main_title_idx: u32,
     pub detected_type: DiscType,
+    pub format: crate::disc::DiscFormat,
 }
 
 fn lang_from_bytes(lang: &[u8; 4]) -> String {
@@ -159,56 +160,7 @@ pub fn analyse_disc(bd_path: &str, player_language: &str) -> Result<TitleAnalysi
             bd_free_title_info(info);
         }
 
-        // Two-pass scoring: compute relative scores now that we have all titles
-        let max_chapters = titles.iter().map(|t| t.chapter_count).max().unwrap_or(1).max(1) as f64;
-        let max_audio = titles.iter().map(|t| t.audio_streams.len()).max().unwrap_or(1).max(1) as f64;
-        let max_subs = titles.iter().map(|t| t.subtitle_streams.len()).max().unwrap_or(1).max(1) as f64;
-
-        for title in &mut titles {
-            let mut score: i32 = 0;
-
-            // Main title bonus
-            if title.index == main_title {
-                score += 10;
-            }
-
-            // Duration scoring
-            if title.duration_secs < 300 {
-                score -= 5;
-            } else if title.duration_secs > 3600 {
-                score += 5;
-            } else if title.duration_secs > 600 {
-                score += 2;
-            }
-
-            // Relative chapter count (up to +4)
-            score += ((title.chapter_count as f64 / max_chapters) * 4.0) as i32;
-
-            // Relative audio stream count (up to +3)
-            score += ((title.audio_streams.len() as f64 / max_audio) * 3.0) as i32;
-
-            // Relative subtitle stream count (up to +2)
-            score += ((title.subtitle_streams.len() as f64 / max_subs) * 2.0) as i32;
-
-            // Unique audio languages (up to +3)
-            let unique_langs: HashSet<&str> = title.audio_streams.iter()
-                .filter(|a| a.language != "und")
-                .map(|a| a.language.as_str())
-                .collect();
-            score += unique_langs.len().min(3) as i32;
-
-            // Bonus if audio matches player language
-            if title.audio_streams.iter().any(|a| a.language == player_language) {
-                score += 2;
-            }
-
-            title.score = score;
-        }
-
-        // Sort by score descending, then index ascending
-        titles.sort_by(|a, b| b.score.cmp(&a.score).then(a.index.cmp(&b.index)));
-
-        let detected_type = detect_disc_type(&titles, main_title);
+        let detected_type = score_and_detect(&mut titles, main_title, player_language);
 
         bd_close(bd);
 
@@ -216,8 +168,69 @@ pub fn analyse_disc(bd_path: &str, player_language: &str) -> Result<TitleAnalysi
             titles,
             main_title_idx: main_title,
             detected_type,
+            format: crate::disc::DiscFormat::BluRay,
         })
     }
+}
+
+/// Score all titles relative to each other, sort them by score, and guess
+/// whether the disc is a movie or a show. Shared by the Blu-ray and DVD
+/// analysis paths.
+pub(crate) fn score_and_detect(
+    titles: &mut Vec<AnalysedTitle>,
+    main_title: u32,
+    player_language: &str,
+) -> DiscType {
+    // Two-pass scoring: compute relative scores now that we have all titles
+    let max_chapters = titles.iter().map(|t| t.chapter_count).max().unwrap_or(1).max(1) as f64;
+    let max_audio = titles.iter().map(|t| t.audio_streams.len()).max().unwrap_or(1).max(1) as f64;
+    let max_subs = titles.iter().map(|t| t.subtitle_streams.len()).max().unwrap_or(1).max(1) as f64;
+
+    for title in titles.iter_mut() {
+        let mut score: i32 = 0;
+
+        // Main title bonus
+        if title.index == main_title {
+            score += 10;
+        }
+
+        // Duration scoring
+        if title.duration_secs < 300 {
+            score -= 5;
+        } else if title.duration_secs > 3600 {
+            score += 5;
+        } else if title.duration_secs > 600 {
+            score += 2;
+        }
+
+        // Relative chapter count (up to +4)
+        score += ((title.chapter_count as f64 / max_chapters) * 4.0) as i32;
+
+        // Relative audio stream count (up to +3)
+        score += ((title.audio_streams.len() as f64 / max_audio) * 3.0) as i32;
+
+        // Relative subtitle stream count (up to +2)
+        score += ((title.subtitle_streams.len() as f64 / max_subs) * 2.0) as i32;
+
+        // Unique audio languages (up to +3)
+        let unique_langs: HashSet<&str> = title.audio_streams.iter()
+            .filter(|a| a.language != "und")
+            .map(|a| a.language.as_str())
+            .collect();
+        score += unique_langs.len().min(3) as i32;
+
+        // Bonus if audio matches player language
+        if title.audio_streams.iter().any(|a| a.language == player_language) {
+            score += 2;
+        }
+
+        title.score = score;
+    }
+
+    // Sort by score descending, then index ascending
+    titles.sort_by(|a, b| b.score.cmp(&a.score).then(a.index.cmp(&b.index)));
+
+    detect_disc_type(titles, main_title)
 }
 
 fn detect_disc_type(titles: &[AnalysedTitle], main_title: u32) -> DiscType {

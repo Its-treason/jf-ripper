@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use crate::bluray::{disc_info, list_titles, read_title};
 use crate::config::Config;
+use crate::disc::{detect_disc_format, DiscFormat};
 use crate::transcode::{
     AudioAction, AudioConfig, ContainerFormat, SubtitleConfig, TranscodeJob, VideoCodec,
     VideoConfig,
@@ -17,17 +17,17 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Print information about a Blu-Ray disc
+    /// Print information about a Blu-ray or DVD disc
     DiscInfo {
         #[arg(long, default_value = "/dev/sr0")]
         bd_path: String,
     },
-    /// List titles available on a Blu-Ray disc
+    /// List titles available on a Blu-ray or DVD disc
     ListTitles {
         #[arg(long, default_value = "/dev/sr0")]
         bd_path: String,
     },
-    /// Read a raw Blu-Ray title to a file
+    /// Read a raw Blu-ray or DVD title to a file
     ReadTitle {
         #[arg(long)]
         title: u32,
@@ -153,11 +153,20 @@ pub fn execute_cli() {
     let cli = Cli::parse();
 
     let result: Result<(), Box<dyn std::error::Error>> = match &cli.command {
-        Commands::DiscInfo { bd_path } => disc_info(bd_path).map_err(Into::into),
-        Commands::ListTitles { bd_path } => list_titles(bd_path).map_err(Into::into),
-        Commands::ReadTitle { title, out_path, bd_path } => read_title(*title, out_path, bd_path)
-            .map(|bytes| println!("Read {} bytes", bytes))
-            .map_err(Into::into),
+        Commands::DiscInfo { bd_path } => detect_disc_format(bd_path).and_then(|f| match f {
+            DiscFormat::BluRay => crate::bluray::disc_info(bd_path),
+            DiscFormat::Dvd => crate::dvd::disc_info(bd_path),
+        }),
+        Commands::ListTitles { bd_path } => detect_disc_format(bd_path).and_then(|f| match f {
+            DiscFormat::BluRay => crate::bluray::list_titles(bd_path),
+            DiscFormat::Dvd => crate::dvd::list_titles(bd_path),
+        }),
+        Commands::ReadTitle { title, out_path, bd_path } => detect_disc_format(bd_path)
+            .and_then(|f| match f {
+                DiscFormat::BluRay => crate::bluray::read_title(*title, out_path, bd_path),
+                DiscFormat::Dvd => crate::dvd::read_title(*title, out_path, bd_path),
+            })
+            .map(|bytes| println!("Read {} bytes", bytes)),
         Commands::Transcode {
             input,
             output,
@@ -331,7 +340,7 @@ fn config_init(config_path: Option<&std::path::Path>) -> Result<(), Box<dyn std:
         .interact_text()?;
 
     let bd_path: String = Input::new()
-        .with_prompt("Blu-ray device path")
+        .with_prompt("Disc device path (Blu-ray/DVD)")
         .default("/dev/sr0".into())
         .interact_text()?;
 

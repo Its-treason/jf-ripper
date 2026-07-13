@@ -46,7 +46,7 @@ pub fn run_tui(
     analysis: &TitleAnalysis,
     config: &Config,
 ) -> Result<MediaChoice, Box<dyn std::error::Error>> {
-    println!("\n=== Blu-ray Disc Analysis ===\n");
+    println!("\n=== {} Disc Analysis ===\n", analysis.format);
     println!("Main title: {}", analysis.main_title_idx);
     println!("Found {} titles:\n", analysis.titles.len());
 

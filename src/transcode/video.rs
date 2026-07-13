@@ -18,6 +18,8 @@ pub struct VideoTranscoder {
     expected_next_pts: i64,
     pts_correction: i64,
     frame_duration: Option<i64>,
+    /// Last PTS sent to the encoder (input timebase, normalized)
+    last_pts: Option<i64>,
 }
 
 impl VideoTranscoder {
@@ -118,6 +120,7 @@ impl VideoTranscoder {
             expected_next_pts: 0,
             pts_correction: 0,
             frame_duration,
+            last_pts: None,
         })
     }
 
@@ -161,13 +164,29 @@ impl VideoTranscoder {
 
     /// Normalize PTS, apply scaler if needed, copy color metadata, and clear pict_type.
     fn prepare_frame(&mut self, decoded: &mut frame::Video) -> Result<frame::Video, TranscodeError> {
-        // Normalize PTS to start from 0, detect discontinuities, then rescale
-        if let Some(pts) = decoded.pts() {
-            let first = *self.first_pts.get_or_insert(pts);
-            let adjusted = self.adjust_pts(pts - first);
-            let rescaled = adjusted.rescale(self.in_tb, self.encoder.time_base());
-            decoded.set_pts(Some(rescaled));
+        // Normalize PTS to start from 0, detect discontinuities, then rescale.
+        // Use the best-effort timestamp: DVD MPEG-PS stamps only some frames
+        // (often once per GOP), so plain frame PTS is frequently missing.
+        let mut pts = match decoded.timestamp() {
+            Some(ts) => {
+                let first = *self.first_pts.get_or_insert(ts);
+                self.adjust_pts(ts - first)
+            }
+            // No timestamp at all: continue from the previous frame
+            None => self
+                .last_pts
+                .map_or(0, |last| last + self.frame_duration.unwrap_or(1)),
+        };
+        // Enforce strictly increasing PTS; backward jitter smaller than the
+        // 1-second discontinuity threshold would otherwise reach the encoder.
+        if let Some(last) = self.last_pts {
+            if pts <= last {
+                pts = last + self.frame_duration.unwrap_or(1);
+            }
         }
+        self.last_pts = Some(pts);
+        let rescaled = pts.rescale(self.in_tb, self.encoder.time_base());
+        decoded.set_pts(Some(rescaled));
 
         let mut frame_to_encode = if let Some(scaler) = &mut self.scaler {
             let mut converted = frame::Video::empty();

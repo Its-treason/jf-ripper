@@ -32,7 +32,8 @@ pub struct Config {
     pub movie_dir: Option<String>,
     pub show_dir: Option<String>,
     pub tmdb_token: Option<String>,
-    #[serde(default = "default_bd_path")]
+    /// Disc device path (Blu-ray or DVD); also accepts ISOs and directories.
+    #[serde(default = "default_bd_path", alias = "disc_path")]
     pub bd_path: String,
     #[serde(default = "default_temp_dir")]
     pub temp_dir: String,
