@@ -156,8 +156,17 @@ pub fn run(
                 out_stream.set_parameters(in_stream.parameters());
                 // Clear container-specific codec tags (e.g. "HDMV" from m2ts) that
                 // are not valid in MKV/MP4; 0 tells the muxer to pick the right tag.
+                // Muxers read the stream-level aspect ratio (matroska derives
+                // DisplayWidth/Height from it), so carry it over from the input.
                 unsafe {
-                    (*(*out_stream.as_mut_ptr()).codecpar).codec_tag = 0;
+                    let out = out_stream.as_mut_ptr();
+                    (*(*out).codecpar).codec_tag = 0;
+                    let in_sar = (*in_stream.as_ptr()).sample_aspect_ratio;
+                    (*out).sample_aspect_ratio = if in_sar.num > 0 {
+                        in_sar
+                    } else {
+                        (*(*out).codecpar).sample_aspect_ratio
+                    };
                 }
                 let out_idx = out_stream.index();
                 actions[vsrc] = StreamAction::CopyVideo { out_idx };
@@ -174,7 +183,15 @@ pub fn run(
                     needs_global_header,
                 )?;
 
-                let out_stream = octx.add_stream_with(vt.encoder.as_ref())?;
+                let mut out_stream = octx.add_stream_with(vt.encoder.as_ref())?;
+                // Muxers read the stream-level aspect ratio, not the codec-level
+                // one: matroska derives DisplayWidth/Height from it. Without it
+                // players that trust the container (mpv, Jellyfin) show 5:4 for
+                // anamorphic DVDs even though the H264 VUI carries the SAR.
+                unsafe {
+                    (*out_stream.as_mut_ptr()).sample_aspect_ratio =
+                        (*vt.encoder.as_ptr()).sample_aspect_ratio;
+                }
                 let out_idx = out_stream.index();
 
                 let mut vt = vt;

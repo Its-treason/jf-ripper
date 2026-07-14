@@ -67,6 +67,12 @@ impl VideoTranscoder {
         enc_ctx.set_format(target_format);
         enc_ctx.set_time_base(in_stream.time_base());
         enc_ctx.set_frame_rate(decoder.frame_rate());
+        // Preserve the sample aspect ratio: anamorphic DVDs store 720x576/480
+        // with a non-square SAR; without it the output displays as 5:4.
+        let sar = decoder.aspect_ratio();
+        if sar.numerator() > 0 && sar.denominator() > 0 {
+            enc_ctx.set_aspect_ratio(sar);
+        }
 
         // Copy color metadata from input to encoder
         unsafe {
