@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ffmpeg-next = "8.1.0"
+ffmpeg-next = "9.0.0"
 libbluray-sys = "1.0.1"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2.183"
