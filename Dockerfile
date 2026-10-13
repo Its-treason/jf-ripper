@@ -61,6 +61,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=dvdcss /usr/local/lib/libdvdcss.so.2* /usr/lib/
-COPY --from=builder /build/target/release/bdrip /usr/local/bin/bdrip
+COPY --from=builder /build/target/release/jf-ripper /usr/local/bin/jf-ripper
 
-ENTRYPOINT ["bdrip"]
+ENTRYPOINT ["jf-ripper"]
