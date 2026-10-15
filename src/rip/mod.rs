@@ -40,12 +40,10 @@ pub(crate) struct ProbedSubtitleStream {
 
 pub(crate) fn probe_input_streams(input_path: &str) -> Result<ProbedStreams, Box<dyn std::error::Error>> {
     ffmpeg_next::init()?;
-    // DVD subpicture streams can start minutes into the program stream, so
-    // probe far deeper than the defaults. Harmless for m2ts input.
-    let mut opts = ffmpeg_next::Dictionary::new();
-    opts.set("probesize", "200000000");
-    opts.set("analyzeduration", "120000000");
-    let ictx = ffmpeg_next::format::input_with_dictionary(&input_path, opts)?;
+    let ictx = ffmpeg_next::format::input_with_dictionary(
+        &input_path,
+        crate::transcode::input_options(),
+    )?;
 
     let mut audio = Vec::new();
     let mut subtitle = Vec::new();

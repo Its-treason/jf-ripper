@@ -11,6 +11,22 @@ pub use config::{
 };
 pub use error::TranscodeError;
 
+/// Demuxer options for opening a raw title. Job creation and the transcoder
+/// must use the same ones: DVD program streams have no header, so stream
+/// indices depend on the order streams are found while probing, and the job's
+/// `source_stream` indices are only valid under identical probing.
+pub fn input_options() -> ffmpeg_next::Dictionary<'static> {
+    let mut opts = ffmpeg_next::Dictionary::new();
+    // DVD subpicture streams can start minutes into the program stream, so
+    // probe far deeper than the defaults. Harmless for m2ts input.
+    opts.set("probesize", "200000000");
+    opts.set("analyzeduration", "120000000");
+    // DVD MPEG-PS leaves PTS unset on many packets; have the demuxer generate
+    // them from DTS (same as ffmpeg's -fflags +genpts). No effect on m2ts.
+    opts.set("fflags", "+genpts");
+    opts
+}
+
 pub struct TranscodeJob {
     input_path: String,
     output_path: String,

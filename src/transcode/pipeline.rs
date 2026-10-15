@@ -1,4 +1,4 @@
-use ffmpeg_next::{codec, format, media, rescale::Rescale, Dictionary, Rational};
+use ffmpeg_next::{codec, format, media, Dictionary, Rational};
 
 use super::{
     audio::AudioTranscoder,
@@ -7,15 +7,19 @@ use super::{
     video::VideoTranscoder,
 };
 
-/// Tracks PTS for copy streams to detect and correct discontinuities.
+/// Tracks timestamps for copy streams to detect and correct discontinuities,
+/// e.g. DVD cells whose timestamps restart from zero.
 struct CopyPtsTracker {
     /// Single normalization offset applied to both PTS and DTS, anchored on
     /// the first timestamp seen. Using one offset preserves pts >= dts for
     /// B-frame streams, which separate per-field offsets would break.
     offset: Option<i64>,
-    expected_next_pts: i64,
-    pts_correction: i64,
-    last_pts: i64,
+    correction: i64,
+    /// Corrected DTS and duration of the previous packet. Discontinuities are
+    /// detected and corrected in decode order (DTS), which unlike PTS is
+    /// monotonic, so a corrected packet always lands after the previous one.
+    last_dts: Option<i64>,
+    last_duration: i64,
     /// Approximate time base denominator / numerator for 1-second threshold
     one_sec_threshold: i64,
 }
@@ -24,62 +28,80 @@ impl CopyPtsTracker {
     fn new(time_base: Rational) -> Self {
         Self {
             offset: None,
-            expected_next_pts: 0,
-            pts_correction: 0,
-            last_pts: 0,
+            correction: 0,
+            last_dts: None,
+            last_duration: 0,
             one_sec_threshold: time_base.1 as i64 / time_base.0.max(1) as i64,
         }
     }
 
     /// Adjust PTS/DTS for a copy-mode packet. Returns (adjusted_pts, adjusted_dts).
-    fn adjust(&mut self, pts: Option<i64>, dts: Option<i64>, is_audio: bool) -> (Option<i64>, Option<i64>) {
-        let offset = match self.offset {
-            Some(o) => o,
-            None => match dts.or(pts) {
-                Some(anchor) => *self.offset.insert(anchor),
-                None => return (pts, dts),
-            },
+    ///
+    /// `sparse` streams (audio, subtitles) only treat backward jumps as
+    /// discontinuities, since forward gaps may be intentional silence or
+    /// simply no subtitle on screen.
+    fn adjust(
+        &mut self,
+        pts: Option<i64>,
+        dts: Option<i64>,
+        duration: i64,
+        sparse: bool,
+    ) -> (Option<i64>, Option<i64>) {
+        // Decode-order timestamp; PTS is the best we have for packets without DTS
+        let Some(raw) = dts.or(pts) else {
+            return (pts, dts);
         };
+        let offset = *self.offset.get_or_insert(raw);
 
-        let raw_pts = match pts {
-            Some(p) => p,
-            // No PTS on this packet (common in DVD MPEG-PS): still normalize
-            // the DTS so it stays consistent with neighboring packets.
-            None => return (None, dts.map(|d| d - offset + self.pts_correction)),
-        };
-
-        let normalized_pts = raw_pts - offset + self.pts_correction;
-
-        // Detect discontinuity
-        if self.expected_next_pts != 0 {
-            let diff = normalized_pts - self.expected_next_pts;
-            // For audio: only detect backward jumps (forward gaps may be intentional silence)
-            let is_discontinuity = if is_audio {
+        if let Some(last_dts) = self.last_dts {
+            let expected = last_dts + self.last_duration;
+            let diff = raw - offset + self.correction - expected;
+            let is_discontinuity = if sparse {
                 diff < -self.one_sec_threshold
             } else {
                 diff.abs() > self.one_sec_threshold
             };
-
             if is_discontinuity {
                 eprintln!(
-                    "[copy] PTS discontinuity: expected {}, got {} (diff {}), correcting",
-                    self.expected_next_pts, normalized_pts, diff
+                    "[copy] timestamp discontinuity: expected {}, got {} (diff {}), correcting",
+                    expected,
+                    expected + diff,
+                    diff
                 );
-                self.pts_correction -= diff;
-                let normalized_pts = raw_pts - offset + self.pts_correction;
-                self.last_pts = normalized_pts;
-                self.expected_next_pts = 0; // reset; will be set from next packet
-                let adjusted_dts = dts.map(|d| d - offset + self.pts_correction);
-                return (Some(normalized_pts), adjusted_dts);
+                self.correction -= diff;
             }
         }
 
-        self.last_pts = normalized_pts;
-        self.expected_next_pts = normalized_pts; // next packet should be >= this
-
-        let adjusted_dts = dts.map(|d| d - offset + self.pts_correction);
-        (Some(normalized_pts), adjusted_dts)
+        let adjust = |t: i64| t - offset + self.correction;
+        self.last_dts = Some(adjust(raw));
+        self.last_duration = duration.max(0);
+        (pts.map(adjust), dts.map(adjust))
     }
+}
+
+/// Write a copied packet, dropping it if its DTS would go backwards. A
+/// leftover timestamp glitch then costs one packet instead of failing the
+/// whole job (the muxer rejects non-monotonic DTS).
+fn write_copy_packet(
+    packet: &mut ffmpeg_next::Packet,
+    octx: &mut format::context::Output,
+    last_dts: &mut [Option<i64>],
+) -> Result<(), TranscodeError> {
+    let out_idx = packet.stream();
+    if let (Some(dts), Some(last)) = (packet.dts(), last_dts[out_idx]) {
+        if dts < last {
+            eprintln!(
+                "[copy] dropping packet with non-monotonic DTS in output stream {}: {} < {}",
+                out_idx, dts, last
+            );
+            return Ok(());
+        }
+    }
+    if let Some(dts) = packet.dts() {
+        last_dts[out_idx] = Some(dts);
+    }
+    packet.write_interleaved(octx)?;
+    Ok(())
 }
 
 /// Build a stream metadata Dictionary from optional language and name fields.
@@ -116,11 +138,7 @@ pub fn run(
 ) -> Result<(), TranscodeError> {
     ffmpeg_next::init()?;
 
-    // DVD MPEG-PS leaves PTS unset on many packets; have the demuxer generate
-    // them from DTS (same as ffmpeg's -fflags +genpts). No effect on m2ts.
-    let mut in_opts = Dictionary::new();
-    in_opts.set("fflags", "+genpts");
-    let mut ictx = format::input_with_dictionary(&input_path, in_opts)?;
+    let mut ictx = format::input_with_dictionary(&input_path, super::input_options())?;
     let mut octx = format::output_as(&output_path, container_format)?;
 
     let needs_global_header = octx
@@ -331,6 +349,8 @@ pub fn run(
         }
     }
 
+    let mut last_out_dts: Vec<Option<i64>> = vec![None; octx.nb_streams() as usize];
+
     // --- Main packet loop ---
     for (in_stream, mut packet) in ictx.packets() {
         let idx = in_stream.index();
@@ -341,41 +361,20 @@ pub fn run(
             continue;
         };
         match action {
-            StreamAction::CopyVideo { out_idx } => {
+            StreamAction::CopyVideo { out_idx }
+            | StreamAction::CopyAudio { out_idx }
+            | StreamAction::CopySubtitle { out_idx } => {
+                let sparse = !matches!(action, StreamAction::CopyVideo { .. });
                 if let Some(tracker) = &mut copy_pts_trackers[idx] {
-                    let (adj_pts, adj_dts) = tracker.adjust(packet.pts(), packet.dts(), false);
-                    let out_tb = octx.stream(*out_idx).unwrap().time_base();
-                    let in_tb = in_stream.time_base();
-                    if let Some(pts) = adj_pts {
-                        packet.set_pts(Some(pts.rescale(in_tb, out_tb)));
-                    }
-                    if let Some(dts) = adj_dts {
-                        packet.set_dts(Some(dts.rescale(in_tb, out_tb)));
-                    }
-                    packet.set_stream(*out_idx);
-                    packet.write_interleaved(&mut octx)?;
+                    let (adj_pts, adj_dts) =
+                        tracker.adjust(packet.pts(), packet.dts(), packet.duration(), sparse);
+                    packet.set_pts(adj_pts);
+                    packet.set_dts(adj_dts);
                 }
-            }
-            StreamAction::CopyAudio { out_idx } => {
-                if let Some(tracker) = &mut copy_pts_trackers[idx] {
-                    let (adj_pts, adj_dts) = tracker.adjust(packet.pts(), packet.dts(), true);
-                    let out_tb = octx.stream(*out_idx).unwrap().time_base();
-                    let in_tb = in_stream.time_base();
-                    if let Some(pts) = adj_pts {
-                        packet.set_pts(Some(pts.rescale(in_tb, out_tb)));
-                    }
-                    if let Some(dts) = adj_dts {
-                        packet.set_dts(Some(dts.rescale(in_tb, out_tb)));
-                    }
-                    packet.set_stream(*out_idx);
-                    packet.write_interleaved(&mut octx)?;
-                }
-            }
-            StreamAction::CopySubtitle { out_idx } => {
                 let out_tb = octx.stream(*out_idx).unwrap().time_base();
                 packet.rescale_ts(in_stream.time_base(), out_tb);
                 packet.set_stream(*out_idx);
-                packet.write_interleaved(&mut octx)?;
+                write_copy_packet(&mut packet, &mut octx, &mut last_out_dts)?;
             }
             StreamAction::EncodeVideo => {
                 if let Some(vt) = &mut video_transcoder {
