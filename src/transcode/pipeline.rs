@@ -334,7 +334,13 @@ pub fn run(
     // --- Main packet loop ---
     for (in_stream, mut packet) in ictx.packets() {
         let idx = in_stream.index();
-        match &actions[idx] {
+        // MPEG-PS (DVD) has no header, so the demuxer can add streams mid-file
+        // (e.g. a subtitle track that first appears late). Those weren't
+        // selected, so drop their packets.
+        let Some(action) = actions.get(idx) else {
+            continue;
+        };
+        match action {
             StreamAction::CopyVideo { out_idx } => {
                 if let Some(tracker) = &mut copy_pts_trackers[idx] {
                     let (adj_pts, adj_dts) = tracker.adjust(packet.pts(), packet.dts(), false);
