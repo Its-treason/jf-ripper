@@ -66,7 +66,7 @@ fn create_movie_job(
         title,
         &media_path.to_string_lossy(),
         &choice.audio_selections,
-        &choice.subtitle_indices,
+        &choice.subtitle_pids,
         config,
     )?;
 
@@ -159,7 +159,7 @@ fn create_show_jobs(
             title,
             &media_path.to_string_lossy(),
             &choice.audio_selections,
-            &choice.subtitle_indices,
+            &choice.subtitle_pids,
             config,
         )?;
 

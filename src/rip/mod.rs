@@ -295,7 +295,7 @@ pub(crate) fn resolve_stream_configs(
     title: &AnalysedTitle,
     input_path: &str,
     audio_selections: &[AudioSelection],
-    subtitle_indices: &[usize],
+    subtitle_pids: &[u16],
     config: &Config,
 ) -> Result<(Vec<AudioConfig>, Vec<SubtitleConfig>, Vec<ChapterInfo>), Box<dyn std::error::Error>> {
     let probed = probe_input_streams(input_path)?;
@@ -305,13 +305,16 @@ pub(crate) fn resolve_stream_configs(
     // into two streams while libbluray counts them as one.
     let mut audio_configs = Vec::new();
     for sel in audio_selections {
-        let bd_stream = title
-            .audio_streams
-            .iter()
-            .find(|a| a.index_in_clip == sel.stream_index_in_clip)
-            .ok_or_else(|| {
-                format!("Audio stream {} not in libbluray analysis", sel.stream_index_in_clip)
-            })?;
+        // Streams are selected once for all titles of a show, but titles can
+        // enable different streams (e.g. a commentary track on only some
+        // episodes). Skip streams this title doesn't have.
+        let Some(bd_stream) = title.audio_streams.iter().find(|a| a.pid == sel.pid) else {
+            eprintln!(
+                "Warning: audio stream 0x{:04x} not in title {}, skipping",
+                sel.pid, title.index
+            );
+            continue;
+        };
 
         // Find ffmpeg stream by PID; take the first match (primary codec, not AC3 core)
         let probed_stream = probed
@@ -320,8 +323,8 @@ pub(crate) fn resolve_stream_configs(
             .find(|p| p.pid == bd_stream.pid)
             .ok_or_else(|| {
                 format!(
-                    "Audio PID 0x{:04x} (libbluray stream {}) not found in ffmpeg probe",
-                    bd_stream.pid, sel.stream_index_in_clip
+                    "Audio PID 0x{:04x} ({}) not found in ffmpeg probe",
+                    bd_stream.pid, bd_stream.language
                 )
             })?;
 
@@ -351,14 +354,14 @@ pub(crate) fn resolve_stream_configs(
 
     // Subtitle streams: match by PID, use libbluray language
     let mut subtitle_configs = Vec::new();
-    for &sub_clip_idx in subtitle_indices {
-        let bd_stream = title
-            .subtitle_streams
-            .iter()
-            .find(|s| s.index_in_clip == sub_clip_idx)
-            .ok_or_else(|| {
-                format!("Subtitle stream {} not in libbluray analysis", sub_clip_idx)
-            })?;
+    for &sub_pid in subtitle_pids {
+        let Some(bd_stream) = title.subtitle_streams.iter().find(|s| s.pid == sub_pid) else {
+            eprintln!(
+                "Warning: subtitle stream 0x{:04x} not in title {}, skipping",
+                sub_pid, title.index
+            );
+            continue;
+        };
 
         // Subtitle streams flagged in the disc metadata sometimes never
         // occur in the actual stream (esp. DVD subpictures) — skip instead
@@ -403,7 +406,7 @@ fn build_transcode_job(
     input_path: &str,
     output_path: &Path,
     audio_selections: &[AudioSelection],
-    subtitle_indices: &[usize],
+    subtitle_pids: &[u16],
     config: &Config,
 ) -> Result<TranscodeJob, Box<dyn std::error::Error>> {
     // Ensure output directory exists
@@ -412,7 +415,7 @@ fn build_transcode_job(
     }
 
     let (audio_tracks, subtitle_tracks, chapters) = resolve_stream_configs(
-        title, input_path, audio_selections, subtitle_indices, config,
+        title, input_path, audio_selections, subtitle_pids, config,
     )?;
 
     let mut job = TranscodeJob::new(input_path, output_path.to_string_lossy())
@@ -444,7 +447,7 @@ fn transcode_title(
         input_path,
         output_path,
         &choice.audio_selections,
-        &choice.subtitle_indices,
+        &choice.subtitle_pids,
         config,
     )?;
     job.run()?;
@@ -464,7 +467,7 @@ fn transcode_title_show(
         input_path,
         output_path,
         &choice.audio_selections,
-        &choice.subtitle_indices,
+        &choice.subtitle_pids,
         config,
     )?;
     job.run()?;

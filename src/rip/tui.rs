@@ -14,7 +14,8 @@ pub struct MovieChoice {
     pub title_idx: u32,
     pub tmdb: TmdbMovie,
     pub audio_selections: Vec<AudioSelection>,
-    pub subtitle_indices: Vec<usize>,
+    /// Stream IDs (PID / DVD stream ID) of the selected subtitle streams
+    pub subtitle_pids: Vec<u16>,
 }
 
 pub struct ShowChoice {
@@ -23,12 +24,16 @@ pub struct ShowChoice {
     pub season: u32,
     pub start_episode: u32,
     pub audio_selections: Vec<AudioSelection>,
-    pub subtitle_indices: Vec<usize>,
+    /// Stream IDs (PID / DVD stream ID) of the selected subtitle streams
+    pub subtitle_pids: Vec<u16>,
 }
 
 #[derive(Clone)]
 pub struct AudioSelection {
-    pub stream_index_in_clip: usize,
+    /// Stream ID (PID / DVD stream ID). Unlike the position in a title's
+    /// stream list, it identifies the same stream across all titles of a
+    /// disc, which matters for shows where titles enable different streams.
+    pub pid: u16,
     pub action: AudioSelectionAction,
 }
 
@@ -150,13 +155,13 @@ fn run_movie_flow(
 
     // Audio/subtitle selection
     let audio_selections = select_audio_streams(&selected_title.audio_streams, config)?;
-    let subtitle_indices = select_subtitle_streams(&selected_title.subtitle_streams, config)?;
+    let subtitle_pids = select_subtitle_streams(&selected_title.subtitle_streams, config)?;
 
     Ok(MediaChoice::Movie(MovieChoice {
         title_idx: selected_title.index,
         tmdb: movie,
         audio_selections,
-        subtitle_indices,
+        subtitle_pids,
     }))
 }
 
@@ -247,7 +252,7 @@ fn run_show_flow(
         .unwrap();
 
     let audio_selections = select_audio_streams(&first_title.audio_streams, config)?;
-    let subtitle_indices = select_subtitle_streams(&first_title.subtitle_streams, config)?;
+    let subtitle_pids = select_subtitle_streams(&first_title.subtitle_streams, config)?;
 
     Ok(MediaChoice::Show(ShowChoice {
         title_indices: selected_indices,
@@ -255,7 +260,7 @@ fn run_show_flow(
         season,
         start_episode,
         audio_selections,
-        subtitle_indices,
+        subtitle_pids,
     }))
 }
 
@@ -360,7 +365,7 @@ fn select_audio_streams(
             .interact()?;
 
         selections.push(AudioSelection {
-            stream_index_in_clip: streams[idx].index_in_clip,
+            pid: streams[idx].pid,
             action: if action_choice == 0 {
                 AudioSelectionAction::EncodeAac
             } else {
@@ -375,7 +380,7 @@ fn select_audio_streams(
 fn select_subtitle_streams(
     streams: &[SubtitleStreamInfo],
     config: &Config,
-) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
+) -> Result<Vec<u16>, Box<dyn std::error::Error>> {
     if streams.is_empty() {
         return Ok(Vec::new());
     }
@@ -405,6 +410,6 @@ fn select_subtitle_streams(
 
     Ok(selected
         .iter()
-        .map(|&i| streams[i].index_in_clip)
+        .map(|&i| streams[i].pid)
         .collect())
 }
