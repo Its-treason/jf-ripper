@@ -316,17 +316,16 @@ pub(crate) fn resolve_stream_configs(
             continue;
         };
 
-        // Find ffmpeg stream by PID; take the first match (primary codec, not AC3 core)
-        let probed_stream = probed
-            .audio
-            .iter()
-            .find(|p| p.pid == bd_stream.pid)
-            .ok_or_else(|| {
-                format!(
-                    "Audio PID 0x{:04x} ({}) not found in ffmpeg probe",
-                    bd_stream.pid, bd_stream.language
-                )
-            })?;
+        // Find ffmpeg stream by PID; take the first match (primary codec, not AC3 core).
+        // Like subtitles, DVD audio streams enabled in the IFO sometimes never
+        // occur in the actual stream — skip instead of failing the whole rip.
+        let Some(probed_stream) = probed.audio.iter().find(|p| p.pid == bd_stream.pid) else {
+            eprintln!(
+                "Warning: audio stream 0x{:04x} ({}) not found in ffmpeg probe, skipping",
+                bd_stream.pid, bd_stream.language
+            );
+            continue;
+        };
 
         let lang = &bd_stream.language;
         let codec_label = match sel.action {

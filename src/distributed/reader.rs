@@ -143,14 +143,17 @@ fn create_show_jobs(
         title_media.push((title_idx, id, media_file));
     }
 
-    // Create job files
-    for (i, (title_idx, id, media_file)) in title_media.iter().enumerate() {
-        let episode_num = choice.start_episode + i as u32;
-
+    // Create job files. All titles have been read by now, so a failure on
+    // one title must not lose the jobs for the others.
+    let create_job = |title_idx: u32,
+                      id: Uuid,
+                      media_file: &str,
+                      episode_num: u32|
+     -> Result<(), Box<dyn std::error::Error>> {
         let title = analysis
             .titles
             .iter()
-            .find(|t| t.index == *title_idx)
+            .find(|t| t.index == title_idx)
             .ok_or_else(|| format!("Title {} not found", title_idx))?;
 
         let media_path = dirs.media.join(media_file);
@@ -178,9 +181,9 @@ fn create_show_jobs(
             .into_owned();
 
         let job = DistributedJob {
-            id: *id,
+            id,
             version: 1,
-            media_file: media_file.clone(),
+            media_file: media_file.to_string(),
             disc_volume_id: None,
             content_type: ContentType::Episode,
             relative_output_path: relative_path,
@@ -205,12 +208,30 @@ fn create_show_jobs(
             "Created job {} for S{:02}E{:02}",
             job.id, choice.season, episode_num
         );
+        Ok(())
+    };
+
+    let mut failed = Vec::new();
+    for (i, (title_idx, id, media_file)) in title_media.iter().enumerate() {
+        let episode_num = choice.start_episode + i as u32;
+        if let Err(e) = create_job(*title_idx, *id, media_file, episode_num) {
+            eprintln!(
+                "Error: no job created for S{:02}E{:02} (title {}): {}",
+                choice.season, episode_num, title_idx, e
+            );
+            let _ = std::fs::remove_file(dirs.media.join(media_file));
+            failed.push(format!("S{:02}E{:02}", choice.season, episode_num));
+        }
     }
 
     if config.eject_on_complete {
         let _ = std::process::Command::new("eject")
             .arg(&config.bd_path)
             .status();
+    }
+
+    if !failed.is_empty() {
+        return Err(format!("no jobs created for {}", failed.join(", ")).into());
     }
 
     Ok(())
