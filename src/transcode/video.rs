@@ -28,6 +28,7 @@ impl VideoTranscoder {
         codec_name: &str,
         crf: Option<u32>,
         preset: Option<&str>,
+        ten_bit: bool,
         extra_options: &[(String, String)],
         out_stream_idx: usize,
         needs_global_header: bool,
@@ -36,7 +37,11 @@ impl VideoTranscoder {
         let dec_ctx = codec::Context::from_parameters(in_stream.parameters())?;
         let decoder = dec_ctx.decoder().video()?;
 
-        let target_format = format::Pixel::YUV420P;
+        let target_format = if ten_bit {
+            format::Pixel::YUV420P10LE
+        } else {
+            format::Pixel::YUV420P
+        };
 
         // Build scaler if source pixel format differs from target
         let scaler = if decoder.format() != target_format {

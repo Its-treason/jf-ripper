@@ -63,6 +63,9 @@ pub struct TranscodeConfig {
     pub video_codec: String,
     pub crf: Option<u32>,
     pub preset: Option<String>,
+    /// Encode 10-bit (yuv420p10le) instead of 8-bit video
+    #[serde(default)]
+    pub ten_bit: bool,
     pub audio_bitrate: Option<u64>,
 }
 
@@ -72,6 +75,7 @@ impl Default for TranscodeConfig {
             video_codec: default_video_codec(),
             crf: None,
             preset: None,
+            ten_bit: false,
             audio_bitrate: None,
         }
     }

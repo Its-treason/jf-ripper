@@ -53,6 +53,9 @@ enum Commands {
         /// Encoder preset (e.g. slow, medium, fast)
         #[arg(long)]
         preset: Option<String>,
+        /// Encode 10-bit video
+        #[arg(long)]
+        ten_bit: bool,
         /// Audio stream indices to copy (e.g. --audio-copy 1 --audio-copy 2)
         #[arg(long = "audio-copy")]
         audio_copy: Vec<usize>,
@@ -173,6 +176,7 @@ pub fn execute_cli() {
             video_codec,
             crf,
             preset,
+            ten_bit,
             audio_copy,
             audio_aac,
             subtitles,
@@ -196,6 +200,7 @@ pub fn execute_cli() {
                     codec,
                     crf: *crf,
                     preset: preset.clone(),
+                    ten_bit: *ten_bit,
                     ..Default::default()
                 });
 
@@ -386,6 +391,7 @@ fn config_init(config_path: Option<&std::path::Path>) -> Result<(), Box<dyn std:
             video_codec,
             crf,
             preset: Some(preset),
+            ten_bit: false,
             audio_bitrate: None,
         },
         languages: crate::config::LanguageConfig {

@@ -27,6 +27,9 @@ pub struct VideoConfig {
     pub crf: Option<u32>,
     /// Encoder preset ("ultrafast", "slow", "veryslow", etc.)
     pub preset: Option<String>,
+    /// Encode 10-bit (yuv420p10le) instead of 8-bit
+    #[serde(default)]
+    pub ten_bit: bool,
     /// Additional codec-private AVOption key/value pairs
     pub extra_options: Vec<(String, String)>,
     /// Override source stream index; None = auto-detect best video stream
@@ -39,6 +42,7 @@ impl Default for VideoConfig {
             codec: VideoCodec::Copy,
             crf: None,
             preset: None,
+            ten_bit: false,
             extra_options: Vec::new(),
             source_stream: None,
         }
@@ -57,6 +61,7 @@ impl VideoConfig {
             codec,
             crf: tc.crf,
             preset: tc.preset.clone(),
+            ten_bit: tc.ten_bit,
             extra_options: Vec::new(),
             source_stream: None,
         }

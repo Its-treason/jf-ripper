@@ -196,6 +196,7 @@ pub fn run(
                     codec_name,
                     video_cfg.crf,
                     video_cfg.preset.as_deref(),
+                    video_cfg.ten_bit,
                     &video_cfg.extra_options,
                     0, // placeholder; set below after add_stream_with
                     needs_global_header,
